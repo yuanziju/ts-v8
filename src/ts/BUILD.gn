@@ -1,0 +1,96 @@
+# Copyright 2026 The V8 Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# TypeScript native support module for V8
+# This module adds TypeScript type system support at every level of V8:
+# parser, AST, bytecode generation, JIT compilation, and hidden classes.
+
+import("../../gni/v8.gni")
+
+config("ts_v8_config") {
+  cflags = []
+  defines = [
+    "V8_ENABLE_TS_SUPPORT",
+    "V8_ENABLE_TS_TYPE_CHECKING",
+  ]
+  include_dirs = [
+    "../..",
+    "../../include",
+  ]
+}
+
+source_set("ts_v8") {
+  configs = [ "ts_v8_config" ]
+
+  sources = [
+    "ts-parser.h",
+    "ts-parser.cc",
+    "ts-type-system.h",
+    "ts-type-system.cc",
+    "ts-type-checker.h",
+    "ts-type-checker.cc",
+    "ts-pipeline.h",
+    "ts-pipeline.cc",
+    "ts-bytecode-extensions.h",
+    "ts-bytecode-extensions.cc",
+    "ts-map-extensions.h",
+    "ts-map-extensions.cc",
+    "ts-jit-integration.h",
+    "ts-jit-integration.cc",
+    "ts-benchmark-suite.h",
+    "ts-benchmark-suite.cc",
+    "ts-build-integration.h",
+    "ts-build-integration.cc",
+  ]
+
+  deps = [
+    "../../:v8",
+    "../../:v8_libbase",
+    "../../:v8_libplatform",
+    "../../src/ast:ast",
+    "../../src/objects:objects",
+    "../../src/compiler:compiler",
+    "../../src/maglev:maglev",
+    "../../src/interpreter:interpreter",
+  ]
+
+  # Allow TS module to access V8 internal headers
+  if (v8_enable_temporal_support) {
+    deps += [ "../../src/wasm:wasm" ]
+  }
+}
+
+# Standalone tsv8 executable
+source_set("tsv8_lib") {
+  configs = [ "ts_v8_config" ]
+
+  sources = [
+    "ts-entry-point.cc",
+  ]
+
+  deps = [
+    ":ts_v8",
+    "../../:v8",
+    "../../:v8_libbase",
+    "../../:v8_libplatform",
+    "../../:v8_snapshot",
+  ]
+}
+
+# Benchmark runner executable
+source_set("tsv8_benchmark") {
+  configs = [ "ts_v8_config" ]
+
+  sources = [
+    "ts-benchmark-suite.cc",
+    "ts-entry-point.cc",
+  ]
+
+  deps = [
+    ":ts_v8",
+    "../../:v8",
+    "../../:v8_libbase",
+    "../../:v8_libplatform",
+  ]
+}
