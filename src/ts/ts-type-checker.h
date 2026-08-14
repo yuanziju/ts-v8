@@ -51,6 +51,11 @@ class TSTypeChecker : public ZoneObject {
 
   TSType* NarrowType(TSType* type, Expression* condition, bool branch_taken);
 
+  TSType* NarrowTypeFromCondition(Expression* condition, bool branch_taken);
+  TSType* NarrowTypeFromTypePredicate(TSType* type, Expression* condition, bool branch_taken);
+  TSType* NarrowFromTypeof(TSType* type, const char* typeof_result, bool branch_taken);
+  TSType* NarrowFromInOperator(TSType* type, const char* key, bool branch_taken);
+
  private:
   TSType* InferLiteralType(Literal* literal);
   TSType* InferBinaryOpType(BinaryOperation* op);

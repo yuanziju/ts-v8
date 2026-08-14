@@ -10,6 +10,7 @@ namespace v8 {
 namespace internal {
 
 class Isolate;
+class JSObject;
 
 namespace ts {
 
@@ -20,6 +21,14 @@ struct TSMapMetadata {
   int expected_property_count = 0;
   bool is_pre_allocated = false;
   int creation_order = 0;
+};
+
+struct TSPropertySlot {
+  int descriptor_index = -1;
+  int field_index = -1;
+  bool is_inobject = true;
+  PropertyDetails details;
+  Representation representation;
 };
 
 class TSFieldType : public ZoneObject {
@@ -89,6 +98,36 @@ class TSMapFactory {
 
   ZoneList<Handle<Map>>* cached_maps() { return &cached_maps_; }
 
+  Handle<Map> GetOrCreateMapForType(TSType* type, Zone* zone);
+
+  Handle<JSObject> AllocateTypedObject(TSType* type, Zone* zone);
+
+  Handle<JSObject> AllocateTypedObjectWithMap(Handle<Map> map, Zone* zone);
+
+  int FindPropertyIndex(Handle<Map> map, const char* property_name);
+
+  TSPropertySlot GetPropertySlot(Handle<Map> map, const char* property_name);
+
+  Handle<Object> LoadFromDescriptor(Handle<JSObject> obj, int index,
+                                     bool is_inobject);
+
+  void StoreToDescriptor(Handle<JSObject> obj, int index, bool is_inobject,
+                          Handle<Object> value);
+
+  Handle<Object> LoadTypedProperty(Handle<JSObject> obj,
+                                    const char* property_name);
+
+  void StoreTypedProperty(Handle<JSObject> obj, const char* property_name,
+                           Handle<Object> value);
+
+  bool HasFastPropertyPath(TSType* type, const char* property_name);
+
+  int GetInObjectPropertyCount(Handle<Map> map);
+
+  int GetMapCacheIndex(TSType* type);
+
+  Isolate* isolate() const { return isolate_; }
+
  private:
   Isolate* isolate_;
   ZoneList<Handle<Map>> cached_maps_;
@@ -102,6 +141,25 @@ class TSMapFactory {
   static constexpr int kTSTypeMetadataBit = 28;
 
   ZoneList<TSMapMetadata*>* metadata_table_ = nullptr;
+};
+
+class TSObjectAllocator {
+ public:
+  explicit TSObjectAllocator(Isolate* isolate, TSMapFactory* map_factory);
+
+  Handle<JSObject> Allocate(TSType* type, Zone* zone);
+
+  Handle<JSObject> AllocateWithMap(Handle<Map> map, Zone* zone);
+
+  Handle<JSObject> AllocateWithValues(
+      TSType* type, Zone* zone,
+      ZoneList<Handle<Object>>* initial_values);
+
+  bool CanAllocateInline(TSType* type) const;
+
+ private:
+  Isolate* isolate_;
+  TSMapFactory* map_factory_;
 };
 
 class TSICOptimizer {

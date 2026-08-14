@@ -200,8 +200,38 @@ TSType* TSTypeChecker::CheckExpression(Expression* expr) {
     case AstNode::kSpread:
       return type_system_->GetAnyType();
 
-    case AstNode::kTemplateLiteral:
-      return type_system_->GetStringType();
+    case AstNode::kTemplateLiteral: {
+      TemplateLiteral* tmpl = expr->AsTemplateLiteral();
+      ZoneList<const char*>* parts =
+          zone_->New<ZoneList<const char*>>(0, zone_);
+      ZoneList<TSType*>* expr_types =
+          zone_->New<ZoneList<TSType*>>(0, zone_);
+
+      int spec_len = tmpl->specs()->length();
+      for (int i = 0; i < spec_len; i++) {
+        parts->Add(tmpl->specs()->at(i)->raw_value()->c_str(), zone_);
+      }
+
+      if (tmpl->expressions() != nullptr) {
+        int expr_count = tmpl->expressions()->length();
+        for (int i = 0; i < expr_count; i++) {
+          TSType* etype = CheckExpression(tmpl->expressions()->at(i));
+          expr_types->Add(etype, zone_);
+        }
+      }
+
+      if (expr_types->length() == 0) {
+        if (parts->length() > 0 && parts->at(0) != nullptr) {
+          TSType* lit = zone_->New<TSType>(zone_, TypeKind::kLiteral);
+          lit->set_literal_value(parts->at(0));
+          lit->element_type_ = type_system_->GetStringType();
+          return lit;
+        }
+        return type_system_->GetStringType();
+      }
+
+      return type_system_->ResolveTemplateLiteralType(parts, expr_types);
+    }
 
     default:
       return type_system_->GetAnyType();
@@ -660,9 +690,36 @@ void TSTypeChecker::CheckIfStatement(IfStatement* stmt) {
     ReportWarning("If condition is not a boolean type",
                   stmt->condition()->position());
   }
+
+  if (cond_type->IsBoolean()) {
+    bool const_value = cond_type->IsTrue();
+    if (const_value) {
+      CheckBlock(stmt->then_statement());
+      return;
+    }
+  }
+
+  EnterBlockContext();
+  if (cond_type->IsUnion()) {
+    TSType* narrowed = NarrowTypeFromCondition(stmt->condition(), true);
+    if (narrowed != nullptr) {
+      TSType* stored = narrowed;
+      context_stack_.Add(stored);
+    }
+  }
   CheckBlock(stmt->then_statement());
+  ExitBlockContext();
+
   if (stmt->else_statement() != nullptr) {
+    EnterBlockContext();
+    if (cond_type->IsUnion()) {
+      TSType* narrowed = NarrowTypeFromCondition(stmt->condition(), false);
+      if (narrowed != nullptr) {
+        context_stack_.Add(narrowed);
+      }
+    }
     CheckBlock(stmt->else_statement());
+    ExitBlockContext();
   }
 }
 
@@ -681,7 +738,18 @@ void TSTypeChecker::CheckForStatement(ForStatement* stmt) {
   if (stmt->next() != nullptr) {
     CheckExpression(stmt->next());
   }
+  EnterBlockContext();
+  if (stmt->condition() != nullptr) {
+    TSType* cond_type = CheckExpression(stmt->condition());
+    if (cond_type->IsUnion()) {
+      TSType* narrowed = NarrowTypeFromCondition(stmt->condition(), true);
+      if (narrowed != nullptr) {
+        context_stack_.Add(narrowed);
+      }
+    }
+  }
   CheckBlock(stmt->body());
+  ExitBlockContext();
 }
 
 void TSTypeChecker::CheckWhileStatement(WhileStatement* stmt) {
@@ -691,7 +759,15 @@ void TSTypeChecker::CheckWhileStatement(WhileStatement* stmt) {
     ReportWarning("While loop condition is not a boolean type",
                   stmt->condition()->position());
   }
+  EnterBlockContext();
+  if (cond_type->IsUnion()) {
+    TSType* narrowed = NarrowTypeFromCondition(stmt->condition(), true);
+    if (narrowed != nullptr) {
+      context_stack_.Add(narrowed);
+    }
+  }
   CheckBlock(stmt->body());
+  ExitBlockContext();
 }
 
 void TSTypeChecker::CheckReturnStatement(ReturnStatement* stmt) {
@@ -1240,6 +1316,366 @@ TSType* TSTypeChecker::NarrowFromTruthiness(TSType* type,
       return type_system_->GetNeverType();
     }
     return type;
+  }
+
+  return type;
+}
+
+TSType* TSTypeChecker::NarrowTypeFromCondition(Expression* condition,
+                                                bool branch_taken) {
+  if (condition == nullptr) return nullptr;
+
+  if (condition->IsCompareOperation()) {
+    CompareOperation* cmp = condition->AsCompareOperation();
+    Token::Value op = cmp->op();
+
+    if (op == Token::kEqStrict || op == Token::kEq) {
+      Expression* left = cmp->left();
+      Expression* right = cmp->right();
+
+      if (left->IsVariableProxy() && right->IsLiteral()) {
+        VariableProxy* proxy = left->AsVariableProxy();
+        if (proxy->is_resolved()) {
+          TSType* var_type = InferMemberAccessType(nullptr, proxy->var()->raw_name());
+          if (var_type != nullptr) {
+            return NarrowFromEquality(var_type, right, branch_taken);
+          }
+        }
+      }
+      if (right->IsVariableProxy() && left->IsLiteral()) {
+        VariableProxy* proxy = right->AsVariableProxy();
+        if (proxy->is_resolved()) {
+          TSType* var_type = InferMemberAccessType(nullptr, proxy->var()->raw_name());
+          if (var_type != nullptr) {
+            return NarrowFromEquality(var_type, left, branch_taken);
+          }
+        }
+      }
+    }
+
+    if (op == Token::kNotEqStrict || op == Token::kNotEq) {
+      Expression* left = cmp->left();
+      Expression* right = cmp->right();
+      Expression* var_expr = nullptr;
+      Expression* lit_expr = nullptr;
+
+      if (left->IsVariableProxy() && right->IsLiteral()) {
+        var_expr = left;
+        lit_expr = right;
+      } else if (right->IsVariableProxy() && left->IsLiteral()) {
+        var_expr = right;
+        lit_expr = left;
+      }
+
+      if (var_expr != nullptr && lit_expr != nullptr) {
+        VariableProxy* proxy = var_expr->AsVariableProxy();
+        if (proxy->is_resolved()) {
+          TSType* var_type = InferMemberAccessType(nullptr, proxy->var()->raw_name());
+          if (var_type != nullptr) {
+            return NarrowFromEquality(var_type, lit_expr, !branch_taken);
+          }
+        }
+      }
+    }
+
+    if (op == Token::kInstanceOf) {
+      return type_system_->GetBooleanType();
+    }
+
+    if (op == Token::kIn) {
+      return type_system_->GetBooleanType();
+    }
+  }
+
+  if (condition->IsUnaryOperation()) {
+    UnaryOperation* unary = condition->AsUnaryOperation();
+    if (unary->op() == Token::kNot) {
+      return NarrowTypeFromCondition(unary->expression(), !branch_taken);
+    }
+    if (unary->op() == Token::kTypeOf) {
+      return type_system_->GetStringType();
+    }
+  }
+
+  if (condition->IsBinaryOperation()) {
+    BinaryOperation* binop = condition->AsBinaryOperation();
+    Token::Value op = binop->op();
+
+    if (op == Token::kAnd) {
+      if (branch_taken) {
+        TSType* left_narrowed =
+            NarrowTypeFromCondition(binop->left(), true);
+        TSType* right_narrowed =
+            NarrowTypeFromCondition(binop->right(), true);
+        if (left_narrowed != nullptr && right_narrowed != nullptr) {
+          if (left_narrowed->IsIdenticalTo(right_narrowed)) return left_narrowed;
+          if (left_narrowed->IsAssignableTo(right_narrowed)) return right_narrowed;
+          if (right_narrowed->IsAssignableTo(left_narrowed)) return left_narrowed;
+          return type_system_->CreateUnionType(left_narrowed, right_narrowed);
+        }
+        return left_narrowed ? left_narrowed : right_narrowed;
+      } else {
+        TSType* left_narrowed =
+            NarrowTypeFromCondition(binop->left(), false);
+        if (left_narrowed != nullptr && !left_narrowed->IsNever()) {
+          return left_narrowed;
+        }
+        TSType* right_narrowed =
+            NarrowTypeFromCondition(binop->right(), false);
+        return right_narrowed;
+      }
+    }
+
+    if (op == Token::kOr) {
+      if (!branch_taken) {
+        TSType* left_narrowed =
+            NarrowTypeFromCondition(binop->left(), false);
+        if (left_narrowed != nullptr && !left_narrowed->IsNever()) {
+          return left_narrowed;
+        }
+        return NarrowTypeFromCondition(binop->right(), false);
+      }
+    }
+  }
+
+  return NarrowFromTruthiness(type_system_->GetAnyType(), branch_taken);
+}
+
+TSType* TSTypeChecker::NarrowTypeFromTypePredicate(TSType* type,
+                                                     Expression* condition,
+                                                     bool branch_taken) {
+  if (type == nullptr) return type;
+  if (condition == nullptr) return type;
+
+  if (condition->IsCompareOperation()) {
+    CompareOperation* cmp = condition->AsCompareOperation();
+    Token::Value op = cmp->op();
+
+    if (op == Token::kEqStrict || op == Token::kEq) {
+      Expression* left = cmp->left();
+      Expression* right = cmp->right();
+      Expression* var_expr = nullptr;
+      Expression* lit_expr = nullptr;
+
+      if (left->IsVariableProxy()) {
+        var_expr = left;
+        lit_expr = right;
+      } else if (right->IsVariableProxy()) {
+        var_expr = right;
+        lit_expr = left;
+      }
+
+      if (var_expr != nullptr && lit_expr != nullptr && lit_expr->IsLiteral()) {
+        Literal* lit = lit_expr->AsLiteral();
+        return NarrowFromEquality(type, lit, branch_taken);
+      }
+    }
+
+    if (op == Token::kInstanceOf) {
+      if (branch_taken) {
+        return NarrowFromInstanceOf(type, cmp->right());
+      }
+    }
+
+    if (op == Token::kIn && branch_taken) {
+      if (cmp->left()->IsLiteral()) {
+        Literal* key_lit = cmp->left()->AsLiteral();
+        if (key_lit->type() == Literal::kString ||
+            key_lit->type() == Literal::kConsString) {
+          const AstRawString* key = key_lit->AsRawString();
+          if (key != nullptr) {
+            return NarrowFromInOperator(type, key->c_str(), true);
+          }
+        }
+      }
+    }
+  }
+
+  if (condition->IsUnaryOperation()) {
+    UnaryOperation* unary = condition->AsUnaryOperation();
+    if (unary->op() == Token::kTypeOf && unary->expression()->IsVariableProxy()) {
+      Expression* expr = unary->expression();
+      if (expr->IsCompareOperation()) {
+        CompareOperation* inner_cmp = expr->AsCompareOperation();
+        Token::Value inner_op = inner_cmp->op();
+        if (inner_op == Token::kEqStrict || inner_op == Token::kEq ||
+            inner_op == Token::kNotEqStrict || inner_op == Token::kNotEq) {
+          bool is_equal = (inner_op == Token::kEqStrict || inner_op == Token::kEq);
+          if (!branch_taken) is_equal = !is_equal;
+          Expression* left = inner_cmp->left();
+          Expression* right = inner_cmp->right();
+          Expression* typeof_expr = nullptr;
+          Expression* literal_expr = nullptr;
+
+          if (left->IsUnaryOperation() && left->AsUnaryOperation()->op() == Token::kTypeOf) {
+            typeof_expr = left;
+            literal_expr = right;
+          } else if (right->IsUnaryOperation() && right->AsUnaryOperation()->op() == Token::kTypeOf) {
+            typeof_expr = right;
+            literal_expr = left;
+          }
+
+          if (typeof_expr != nullptr && literal_expr != nullptr && literal_expr->IsLiteral()) {
+            Literal* lit = literal_expr->AsLiteral();
+            const char* type_name = nullptr;
+            if (lit->type() == Literal::kString || lit->type() == Literal::kConsString) {
+              const AstRawString* str = lit->AsRawString();
+              if (str != nullptr) type_name = str->c_str();
+            }
+            if (type_name != nullptr) {
+              return NarrowFromTypeof(type, type_name, is_equal);
+            }
+          }
+        }
+      }
+    }
+    if (unary->op() == Token::kNot) {
+      return NarrowTypeFromTypePredicate(type, unary->expression(), !branch_taken);
+    }
+  }
+
+  if (condition->IsBinaryOperation()) {
+    BinaryOperation* binop = condition->AsBinaryOperation();
+    Token::Value op = binop->op();
+    if (op == Token::kAnd) {
+      if (branch_taken) {
+        TSType* left_narrowed =
+            NarrowTypeFromTypePredicate(type, binop->left(), true);
+        return NarrowTypeFromTypePredicate(left_narrowed, binop->right(), true);
+      }
+    }
+    if (op == Token::kOr) {
+      if (!branch_taken) {
+        TSType* left_narrowed =
+            NarrowTypeFromTypePredicate(type, binop->left(), false);
+        return NarrowTypeFromTypePredicate(left_narrowed, binop->right(), false);
+      }
+    }
+  }
+
+  return NarrowFromTruthiness(type, branch_taken);
+}
+
+TSType* TSTypeChecker::NarrowFromTypeof(TSType* type,
+                                         const char* typeof_result,
+                                         bool branch_taken) {
+  if (type == nullptr) return type;
+
+  if (!branch_taken) {
+    if (strcmp(typeof_result, "string") == 0) {
+      if (type->IsUnion()) {
+        ZoneList<TSType*>* members = type->GetUnionMembers();
+        if (members != nullptr) {
+          ZoneList<TSType*>* filtered =
+              zone_->New<ZoneList<TSType*>>(members->length(), zone_);
+          for (int i = 0; i < members->length(); i++) {
+            if (!members->at(i)->IsString()) {
+              filtered->Add(members->at(i), zone_);
+            }
+          }
+          if (filtered->length() == 0) return type_system_->GetNeverType();
+          if (filtered->length() == 1) return filtered->at(0);
+          return type_system_->CreateUnionType(filtered);
+        }
+      }
+      if (type->IsString()) return type_system_->GetNeverType();
+      return type;
+    }
+    if (strcmp(typeof_result, "number") == 0) {
+      if (type->IsUnion()) {
+        ZoneList<TSType*>* members = type->GetUnionMembers();
+        if (members != nullptr) {
+          ZoneList<TSType*>* filtered =
+              zone_->New<ZoneList<TSType*>>(members->length(), zone_);
+          for (int i = 0; i < members->length(); i++) {
+            if (!members->at(i)->IsNumber()) {
+              filtered->Add(members->at(i), zone_);
+            }
+          }
+          if (filtered->length() == 0) return type_system_->GetNeverType();
+          if (filtered->length() == 1) return filtered->at(0);
+          return type_system_->CreateUnionType(filtered);
+        }
+      }
+      if (type->IsNumber()) return type_system_->GetNeverType();
+      return type;
+    }
+    if (strcmp(typeof_result, "boolean") == 0) {
+      if (type->IsUnion()) {
+        ZoneList<TSType*>* members = type->GetUnionMembers();
+        if (members != nullptr) {
+          ZoneList<TSType*>* filtered =
+              zone_->New<ZoneList<TSType*>>(members->length(), zone_);
+          for (int i = 0; i < members->length(); i++) {
+            if (!members->at(i)->IsBoolean()) {
+              filtered->Add(members->at(i), zone_);
+            }
+          }
+          if (filtered->length() == 0) return type_system_->GetNeverType();
+          if (filtered->length() == 1) return filtered->at(0);
+          return type_system_->CreateUnionType(filtered);
+        }
+      }
+      if (type->IsBoolean()) return type_system_->GetNeverType();
+      return type;
+    }
+    return type;
+  }
+
+  if (strcmp(typeof_result, "string") == 0) {
+    return type_system_->GetStringType();
+  }
+  if (strcmp(typeof_result, "number") == 0) {
+    return type_system_->GetNumberType();
+  }
+  if (strcmp(typeof_result, "boolean") == 0) {
+    return type_system_->GetBooleanType();
+  }
+  if (strcmp(typeof_result, "bigint") == 0) {
+    return type_system_->GetBigIntType();
+  }
+  if (strcmp(typeof_result, "undefined") == 0) {
+    return type_system_->GetUndefinedType();
+  }
+  if (strcmp(typeof_result, "function") == 0) {
+    return type_system_->GetFunctionType();
+  }
+
+  return type;
+}
+
+TSType* TSTypeChecker::NarrowFromInOperator(TSType* type, const char* key,
+                                              bool branch_taken) {
+  if (type == nullptr || key == nullptr) return type;
+
+  if (branch_taken) {
+    if (type->IsObject() || type->IsInterface()) {
+      ZoneList<PropertyDescriptor>* props = type->GetProperties();
+      if (props != nullptr) {
+        for (int i = 0; i < props->length(); i++) {
+          if (strcmp(props->at(i).name, key) == 0) {
+            return type;
+          }
+        }
+      }
+    }
+    return type;
+  }
+
+  if (type->IsObject() || type->IsInterface()) {
+    ZoneList<PropertyDescriptor>* props = type->GetProperties();
+    if (props != nullptr) {
+      ZoneList<PropertyDescriptor>* new_props =
+          zone_->New<ZoneList<PropertyDescriptor>>(props->length(), zone_);
+      for (int i = 0; i < props->length(); i++) {
+        if (strcmp(props->at(i).name, key) != 0) {
+          new_props->Add(props->at(i), zone_);
+        }
+      }
+      TSType* result = zone_->New<TSType>(zone_, TypeKind::kObject);
+      result->set_properties(new_props);
+      return result;
+    }
   }
 
   return type;

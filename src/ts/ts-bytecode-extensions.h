@@ -2,6 +2,7 @@
 #define V8_TS_TS_BYTECODE_EXTENSIONS_H_
 
 #include "src/ts/ts-type-system.h"
+#include "src/ts/ts-map-extensions.h"
 #include "src/interpreter/bytecode-generator.h"
 #include "src/interpreter/bytecodes.h"
 
@@ -43,6 +44,7 @@ enum class TSBytecodeStrategy : uint8_t {
   kSkipHoleChecks,
   kSpecializedPath,
   kFullCheck,
+  kZeroCostPath,
 };
 
 struct TSBytecodeConfig {
@@ -53,12 +55,14 @@ struct TSBytecodeConfig {
   bool use_smi_fast_paths = true;
   bool skip_map_checks = true;
   bool inline_property_access = true;
+  bool use_zero_cost_abstraction = true;
 };
 
 class TSBytecodeBuilder {
  public:
   explicit TSBytecodeBuilder(BytecodeArrayBuilder* builder,
-                              const TSBytecodeConfig& config);
+                              const TSBytecodeConfig& config,
+                              TSMapFactory* map_factory = nullptr);
 
   void LoadTypedVariable(const AstRawString* name, int feedback_slot,
                           TSType* expected_type);
@@ -89,13 +93,25 @@ class TSBytecodeBuilder {
   BytecodeArrayBuilder* builder() { return builder_; }
   const TSBytecodeConfig& config() const { return config_; }
 
+  void EmitLoadTypedPropertyFromDescriptor(Register object,
+                                            const AstRawString* name,
+                                            int descriptor_index,
+                                            bool is_inobject);
+  void EmitStoreTypedPropertyToDescriptor(Register object,
+                                           const AstRawString* name,
+                                           int descriptor_index,
+                                           bool is_inobject);
+  void EmitCreateTypedObject(TSType* object_type);
+
  private:
   BytecodeArrayBuilder* builder_;
   TSBytecodeConfig config_;
+  TSMapFactory* map_factory_;
 
   bool IsTypeStable(TSType* type) const;
   bool IsPrimitiveType(TSType* type) const;
   TSBytecodeStrategy SelectStrategy(TSType* type) const;
+  bool CanUseZeroCostPath(TSType* type) const;
 };
 
 class TSBytecodeIntegrator {
@@ -117,6 +133,10 @@ class TSBytecodeIntegrator {
 
   static bool TrySkipReturnTypeCheck(BytecodeGenerator* generator,
                                       ReturnStatement* node);
+
+  static bool TryZeroCostObjectCreate(BytecodeGenerator* generator,
+                                        TSType* object_type,
+                                        TSMapFactory* map_factory);
 };
 
 }  // namespace ts

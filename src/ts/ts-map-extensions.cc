@@ -18,6 +18,9 @@
 #include "src/roots/roots.h"
 #include "src/ts/ts-type-system.h"
 
+#include "src/objects/js-objects.h"
+#include "src/objects/js-objects-inl.h"
+
 namespace v8 {
 namespace internal {
 
@@ -1097,6 +1100,538 @@ int TSICOptimizer::OptimizeFeedbackSlot(TSType* expected_type,
   }
 
   return current_feedback;
+}
+
+// ===========================================================================
+// TSMapFactory – Zero-Cost Abstraction: Static Map Allocation & Direct
+// Descriptor Access
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TSMapFactory::GetOrCreateMapForType
+// Retrieves a cached Map for a TS type, or creates + caches one if absent.
+// This is the central hub for Map caching – the same TS type always gets
+// the same V8 Map object, enabling object layout stability.
+// ---------------------------------------------------------------------------
+
+Handle<Map> TSMapFactory::GetOrCreateMapForType(TSType* type, Zone* zone) {
+  DCHECK_NOT_NULL(type);
+  DCHECK_NOT_NULL(zone);
+
+  for (int i = 0; i < cached_maps_.length(); i++) {
+    Handle<Map> cached = cached_maps_.at(i);
+    TSMapMetadata* md = GetMetadata(cached);
+    if (md != nullptr && md->ts_type == type) {
+      return cached;
+    }
+  }
+
+  Handle<Map> new_map = CreateMapFromType(type, zone);
+
+  if (!new_map.is_null()) {
+    cached_maps_.Add(new_map, zone);
+  }
+
+  return new_map;
+}
+
+// ---------------------------------------------------------------------------
+// TSMapFactory::AllocateTypedObject
+// Creates a JSObject with the pre-built Map for the given TS type.
+// This bypasses CreateEmptyObjectLiteral + dynamic property additions.
+// The object is born with its complete property layout.
+// ---------------------------------------------------------------------------
+
+Handle<JSObject> TSMapFactory::AllocateTypedObject(TSType* type,
+                                                    Zone* zone) {
+  DCHECK_NOT_NULL(type);
+  DCHECK_NOT_NULL(zone);
+
+  if (!type->HasKnownShape()) {
+    return Handle<JSObject>();
+  }
+
+  Handle<Map> map = GetOrCreateMapForType(type, zone);
+  if (map.is_null()) {
+    return Handle<JSObject>();
+  }
+
+  return AllocateTypedObjectWithMap(map, zone);
+}
+
+// ---------------------------------------------------------------------------
+// TSMapFactory::AllocateTypedObjectWithMap
+// Low-level allocation: creates a JSObject from a pre-built Map.
+// This calls Factory::NewJSObjectFromMap, which:
+//   1. Allocates the object with the exact instance_size from the Map
+//   2. Initializes all in-object property slots to the Map's initial value
+//      (the filler or undefined)
+//   3. Sets the Map pointer
+// No IC transitions happen – the object has its final shape from birth.
+// ---------------------------------------------------------------------------
+
+Handle<JSObject> TSMapFactory::AllocateTypedObjectWithMap(Handle<Map> map,
+                                                           Zone* zone) {
+  DCHECK_NOT_NULL(map);
+
+  int inobject_count = GetInObjectPropertyCount(map);
+  if (inobject_count > 0) {
+    SetInobjectProperties(map, inobject_count);
+  }
+
+  Handle<JSObject> obj = isolate_->factory()->NewJSObjectFromMap(map);
+  return obj;
+}
+
+// ---------------------------------------------------------------------------
+// TSMapFactory::GetInObjectPropertyCount
+// Returns the number of in-object properties based on the Map's
+// NumberOfOwnDescriptors. For TS types with known shapes, all properties
+// are stored in-object (no out-of-object properties needed).
+// ---------------------------------------------------------------------------
+
+int TSMapFactory::GetInObjectPropertyCount(Handle<Map> map) {
+  DCHECK_NOT_NULL(map);
+  int own_descriptors = map->NumberOfOwnDescriptors();
+  return own_descriptors;
+}
+
+// ---------------------------------------------------------------------------
+// TSMapFactory::GetMapCacheIndex
+// Returns a stable index for caching Maps by type. This allows the bytecode
+// builder to reference a Map by index rather than embedding the full Map
+// object, enabling compact bytecode and fast lookups.
+// ---------------------------------------------------------------------------
+
+int TSMapFactory::GetMapCacheIndex(TSType* type) {
+  DCHECK_NOT_NULL(type);
+  for (int i = 0; i < cached_maps_.length(); i++) {
+    Handle<Map> cached = cached_maps_.at(i);
+    TSMapMetadata* meta = GetMetadata(cached);
+    if (meta != nullptr && meta->ts_type == type) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// ---------------------------------------------------------------------------
+// TSMapFactory::FindPropertyIndex
+// Searches the Map's DescriptorArray for a property by name.
+// Returns the descriptor index (>=0) or -1 if not found.
+// This bypasses V8's standard property lookup – we go straight to the
+// descriptor array.
+// ---------------------------------------------------------------------------
+
+int TSMapFactory::FindPropertyIndex(Handle<Map> map,
+                                     const char* property_name) {
+  DCHECK_NOT_NULL(map);
+  DCHECK_NOT_NULL(property_name);
+
+  int own_descriptors = map->NumberOfOwnDescriptors();
+  if (own_descriptors == 0) return -1;
+
+  Tagged<DescriptorArray> descriptors =
+      Cast<DescriptorArray>(map->instance_descriptors());
+
+  Handle<String> search_name =
+      isolate_->factory()->NewStringFromUtf8(base::StrVector(property_name))
+          .ToHandleChecked();
+
+  for (int i = 0; i < own_descriptors; i++) {
+    InternalIndex idx(i);
+    Tagged<Name> key = descriptors->GetKey(idx);
+    if (key.IsEqual(*search_name)) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+// ---------------------------------------------------------------------------
+// TSMapFactory::GetPropertySlot
+// Returns complete property slot information for direct field access.
+// This is the bridge between TS type information and raw memory access:
+// given a property name, we get the exact descriptor index, whether it's
+// in-object or out-of-object, and its representation (Smi, Double, HeapObject).
+// ---------------------------------------------------------------------------
+
+TSPropertySlot TSMapFactory::GetPropertySlot(Handle<Map> map,
+                                               const char* property_name) {
+  DCHECK_NOT_NULL(map);
+  DCHECK_NOT_NULL(property_name);
+
+  TSPropertySlot slot;
+  slot.descriptor_index = -1;
+  slot.field_index = -1;
+  slot.is_inobject = true;
+
+  int index = FindPropertyIndex(map, property_name);
+  if (index < 0) return slot;
+
+  slot.descriptor_index = index;
+
+  Tagged<DescriptorArray> descriptors =
+      Cast<DescriptorArray>(map->instance_descriptors());
+  InternalIndex idx(index);
+  slot.details = descriptors->GetDetails(idx);
+  slot.representation = slot.details.representation();
+
+  int first_inobject =
+      map->GetInObjectPropertiesStartInWords() * kTaggedSize / kTaggedSize;
+  int inobject_count = GetInObjectPropertyCount(map);
+
+  if (index < inobject_count) {
+    slot.is_inobject = true;
+    slot.field_index = index;
+  } else {
+    slot.is_inobject = false;
+    slot.field_index = index - inobject_count;
+  }
+
+  return slot;
+}
+
+// ---------------------------------------------------------------------------
+// TSMapFactory::LoadFromDescriptor
+// Direct field load bypassing IC. Uses the DescriptorArray to determine
+// the field location and reads it directly.
+//
+// For Smi fields: returns the tagged Smi directly (no HeapNumber allocation)
+// For Double fields: returns a HeapNumber (or Smi if small enough)
+// For HeapObject fields: returns the tagged pointer
+// ---------------------------------------------------------------------------
+
+Handle<Object> TSMapFactory::LoadFromDescriptor(Handle<JSObject> obj,
+                                                  int index,
+                                                  bool is_inobject) {
+  DCHECK_NOT_NULL(obj);
+
+  Handle<Map> map = Handle<Map>(obj->map());
+  Tagged<DescriptorArray> descriptors =
+      Cast<DescriptorArray>(map->instance_descriptors());
+  InternalIndex idx(index);
+  PropertyDetails details = descriptors->GetDetails(idx);
+  Representation repr = details.representation();
+
+  if (is_inobject) {
+    int field_offset = JSObject::kHeaderSize + kTaggedSize * index;
+
+    Tagged<Object> raw = obj->RawFieldAccess(field_offset);
+
+    if (repr.IsSmi()) {
+      if (IsSmi(raw)) {
+        return handle(raw, isolate_);
+      }
+      if (IsHeapNumber(raw)) {
+        return handle(raw, isolate_);
+      }
+      return isolate_->factory()->NewNumber(0);
+    }
+
+    if (repr.IsDouble()) {
+      if (IsHeapNumber(raw)) {
+        return handle(raw, isolate_);
+      }
+      if (IsSmi(raw)) {
+        return handle(raw, isolate_);
+      }
+      return isolate_->factory()->NewNumber(0);
+    }
+
+    if (repr.IsHeapObject()) {
+      if (IsHeapObject(raw)) {
+        return handle(raw, isolate_);
+      }
+      return isolate_->factory()->undefined_value();
+    }
+
+    return handle(raw, isolate_);
+  }
+
+  int outobject_offset = -1;
+  int inobject_count = GetInObjectPropertyCount(map);
+  int outobject_index = index - inobject_count;
+
+  Tagged<PropertyArray> properties = obj->property_array();
+  Tagged<Object> raw =
+      properties->get(outobject_index + PropertyArray::kHeaderSize / kTaggedSize);
+
+  if (repr.IsSmi()) {
+    if (IsSmi(raw)) return handle(raw, isolate_);
+    return isolate_->factory()->NewNumber(0);
+  }
+
+  if (repr.IsHeapObject()) {
+    if (IsHeapObject(raw)) return handle(raw, isolate_);
+    return isolate_->factory()->undefined_value();
+  }
+
+  return handle(raw, isolate_);
+}
+
+// ---------------------------------------------------------------------------
+// TSMapFactory::StoreToDescriptor
+// Direct field store bypassing IC.
+//
+// For Smi fields: stores the value directly (must be Smi-compatible)
+// For Double fields: converts and stores as HeapNumber or Double
+// For HeapObject fields: stores the tagged pointer directly
+// ---------------------------------------------------------------------------
+
+void TSMapFactory::StoreToDescriptor(Handle<JSObject> obj,
+                                      int index,
+                                      bool is_inobject,
+                                      Handle<Object> value) {
+  DCHECK_NOT_NULL(obj);
+  DCHECK_NOT_NULL(value);
+
+  Handle<Map> map = Handle<Map>(obj->map());
+  Tagged<DescriptorArray> descriptors =
+      Cast<DescriptorArray>(map->instance_descriptors());
+  InternalIndex idx(index);
+  PropertyDetails details = descriptors->GetDetails(idx);
+  Representation repr = details.representation();
+
+  if (is_inobject) {
+    int field_offset = JSObject::kHeaderSize + kTaggedSize * index;
+
+    if (repr.IsSmi()) {
+      if (IsSmi(*value)) {
+        obj->set_raw_field(field_offset, *value);
+        return;
+      }
+      if (IsHeapNumber(*value)) {
+        double num = HeapNumber::cast(*value).value();
+        if (Smi::IsValid(num)) {
+          obj->set_raw_field(field_offset, Smi::FromInt(
+              static_cast<int>(num)));
+          return;
+        }
+        Handle<Object> boxed = isolate_->factory()->NewNumber(num);
+        obj->set_raw_field(field_offset, *boxed);
+        return;
+      }
+      obj->set_raw_field(field_offset, Smi::FromInt(0));
+      return;
+    }
+
+    if (repr.IsDouble()) {
+      if (IsSmi(*value)) {
+        Handle<Object> boxed =
+            isolate_->factory()->NewNumber(Smi::ToInt(*value));
+        obj->set_raw_field(field_offset, *boxed);
+        return;
+      }
+      obj->set_raw_field(field_offset, *value);
+      return;
+    }
+
+    if (repr.IsHeapObject()) {
+      obj->set_raw_field(field_offset, *value);
+      return;
+    }
+
+    obj->set_raw_field(field_offset, *value);
+    return;
+  }
+
+  int inobject_count = GetInObjectPropertyCount(map);
+  int outobject_index = index - inobject_count;
+
+  Tagged<PropertyArray> properties = obj->property_array();
+
+  if (repr.IsSmi()) {
+    if (IsSmi(*value)) {
+      properties->set(outobject_index, *value);
+      return;
+    }
+    if (IsHeapNumber(*value)) {
+      double num = HeapNumber::cast(*value).value();
+      if (Smi::IsValid(num)) {
+        properties->set(outobject_index,
+                         Smi::FromInt(static_cast<int>(num)));
+        return;
+      }
+      Handle<Object> boxed = isolate_->factory()->NewNumber(num);
+      properties->set(outobject_index, *boxed);
+      return;
+    }
+    properties->set(outobject_index, Smi::FromInt(0));
+    return;
+  }
+
+  properties->set(outobject_index, *value);
+}
+
+// ---------------------------------------------------------------------------
+// TSMapFactory::LoadTypedProperty
+// High-level typed property load: find the property slot by name on the
+// object's Map, then perform a direct descriptor load.
+// This completely bypasses V8's named property accessor, the IC system,
+// and any potential prototype chain walk.
+// ---------------------------------------------------------------------------
+
+Handle<Object> TSMapFactory::LoadTypedProperty(
+    Handle<JSObject> obj, const char* property_name) {
+  DCHECK_NOT_NULL(obj);
+  DCHECK_NOT_NULL(property_name);
+
+  Handle<Map> map = Handle<Map>(obj->map());
+  TSPropertySlot slot = GetPropertySlot(map, property_name);
+
+  if (slot.descriptor_index < 0) {
+    return isolate_->factory()->undefined_value();
+  }
+
+  return LoadFromDescriptor(obj, slot.descriptor_index, slot.is_inobject);
+}
+
+// ---------------------------------------------------------------------------
+// TSMapFactory::StoreTypedProperty
+// High-level typed property store: find the property slot by name on the
+// object's Map, then perform a direct descriptor store.
+// No IC transitions, no map checks, no property additions.
+// ---------------------------------------------------------------------------
+
+void TSMapFactory::StoreTypedProperty(Handle<JSObject> obj,
+                                       const char* property_name,
+                                       Handle<Object> value) {
+  DCHECK_NOT_NULL(obj);
+  DCHECK_NOT_NULL(property_name);
+  DCHECK_NOT_NULL(value);
+
+  Handle<Map> map = Handle<Map>(obj->map());
+  TSPropertySlot slot = GetPropertySlot(map, property_name);
+
+  if (slot.descriptor_index < 0) {
+    return;
+  }
+
+  StoreToDescriptor(obj, slot.descriptor_index, slot.is_inobject, value);
+}
+
+// ---------------------------------------------------------------------------
+// TSMapFactory::HasFastPropertyPath
+// Checks whether a property on a given TS type can be accessed via the
+// fast descriptor path (i.e., the type has a known shape and the property
+// is a defined own property). Returns true for zero-cost abstraction paths.
+// ---------------------------------------------------------------------------
+
+bool TSMapFactory::HasFastPropertyPath(TSType* type,
+                                        const char* property_name) {
+  DCHECK_NOT_NULL(type);
+  DCHECK_NOT_NULL(property_name);
+
+  if (!type->HasKnownShape()) return false;
+
+  ZoneList<PropertyDescriptor>* props = type->GetProperties();
+  if (props == nullptr) return false;
+
+  for (int i = 0; i < props->length(); i++) {
+    if (strcmp(props->at(i).name, property_name) == 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// ===========================================================================
+// TSObjectAllocator – Type-Locked Object Allocator
+// ===========================================================================
+
+TSObjectAllocator::TSObjectAllocator(Isolate* isolate,
+                                     TSMapFactory* map_factory)
+    : isolate_(isolate), map_factory_(map_factory) {}
+
+// ---------------------------------------------------------------------------
+// TSObjectAllocator::CanAllocateInline
+// Determines if a TS type can be allocated inline with its pre-built Map.
+// Only types with known shapes (interfaces/classes with properties)
+// qualify for the zero-cost abstraction path.
+// ---------------------------------------------------------------------------
+
+bool TSObjectAllocator::CanAllocateInline(TSType* type) const {
+  if (type == nullptr) return false;
+  if (!type->HasKnownShape()) return false;
+  if (type->GetPropertyCount() == 0) return false;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// TSObjectAllocator::Allocate
+// Allocates a type-locked object: the object is born with its complete
+// Map, all property slots are pre-sized, and zero runtime property
+// lookups or IC transitions occur.
+// ---------------------------------------------------------------------------
+
+Handle<JSObject> TSObjectAllocator::Allocate(TSType* type,
+                                               Zone* zone) {
+  DCHECK_NOT_NULL(type);
+  DCHECK_NOT_NULL(zone);
+
+  if (!CanAllocateInline(type)) {
+    return Handle<JSObject>();
+  }
+
+  return map_factory_->AllocateTypedObject(type, zone);
+}
+
+// ---------------------------------------------------------------------------
+// TSObjectAllocator::AllocateWithMap
+// Directly allocates an object using a pre-built Map. This is the ultimate
+// zero-cost path: the Map was created at type-checking time, the object
+// is allocated with exactly the right number of in-object properties, and
+// no property additions or IC transitions ever occur.
+// ---------------------------------------------------------------------------
+
+Handle<JSObject> TSObjectAllocator::AllocateWithMap(Handle<Map> map,
+                                                     Zone* zone) {
+  DCHECK_NOT_NULL(map);
+  DCHECK_NOT_NULL(zone);
+
+  return map_factory_->AllocateTypedObjectWithMap(map, zone);
+}
+
+// ---------------------------------------------------------------------------
+// TSObjectAllocator::AllocateWithValues
+// Allocates a type-locked object and pre-fills property slots with initial
+// values. The values must match the property order defined in the TS type.
+// This enables `new User(name, age)` where the constructor body is
+// completely eliminated by the compiler.
+// ---------------------------------------------------------------------------
+
+Handle<JSObject> TSObjectAllocator::AllocateWithValues(
+    TSType* type, Zone* zone,
+    ZoneList<Handle<Object>>* initial_values) {
+  DCHECK_NOT_NULL(type);
+  DCHECK_NOT_NULL(zone);
+
+  if (!CanAllocateInline(type)) {
+    return Handle<JSObject>();
+  }
+
+  if (initial_values == nullptr || initial_values->length() == 0) {
+    return Allocate(type, zone);
+  }
+
+  Handle<JSObject> obj = map_factory_->AllocateTypedObject(type, zone);
+  if (obj.is_null()) return obj;
+
+  Handle<Map> map = Handle<Map>(obj->map());
+  int inobject_count = map_factory_->GetInObjectPropertyCount(map);
+
+  int count = initial_values->length();
+  if (count > inobject_count) count = inobject_count;
+
+  for (int i = 0; i < count; i++) {
+    Handle<Object> val = initial_values->at(i);
+    map_factory_->StoreToDescriptor(obj, i, true, val);
+  }
+
+  return obj;
 }
 
 }  // namespace ts
