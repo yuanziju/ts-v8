@@ -85,7 +85,7 @@ class TSMapFactory {
   ZoneList<Handle<Map>>* CreateMapsForType(TSType* type, Zone* zone);
   Handle<Map> CreateStableMap(TSType* type, Zone* zone);
 
-  void AttachMetadata(Handle<Map> map, TSMapMetadata* metadata);
+  void AttachMetadata(Handle<Map> map, TSMapMetadata* metadata, Zone* zone);
   TSMapMetadata* GetMetadata(Handle<Map> map);
 
   Handle<Map> CreateSpecializedTransition(Handle<Map> from_map,
@@ -140,7 +140,7 @@ class TSMapFactory {
 
   static constexpr int kTSTypeMetadataBit = 28;
 
-  ZoneList<TSMapMetadata*>* metadata_table_ = nullptr;
+  ZoneList<TSMapMetadata*> metadata_table_;
 };
 
 class TSObjectAllocator {

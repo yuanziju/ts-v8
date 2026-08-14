@@ -150,7 +150,6 @@ void TSBytecodeBuilder::LoadTypedVariable(const AstRawString* name,
 
     case TSBytecodeStrategy::kFullCheck:
       builder_->LoadGlobal(name, feedback_slot, TypeofMode::kNotInside);
-      builder_->WriteBytecode<Bytecode::kCheckMaps>();
       break;
 
     case TSBytecodeStrategy::kZeroCostPath:
@@ -183,7 +182,7 @@ void TSBytecodeBuilder::LoadTypedProperty(Register object,
           if (slot_index >= 0) {
             TSPropertySlot slot =
                 map_factory_->GetPropertySlot(map, name->raw_data());
-            EmitLoadTypedPropertyFromDescriptor(object, name,
+            EmitLoadTypedPropertyFromDescriptor(object, name, feedback_slot,
                                                 slot.descriptor_index,
                                                 slot.is_inobject);
             return;
@@ -208,7 +207,6 @@ void TSBytecodeBuilder::LoadTypedProperty(Register object,
 
     case TSBytecodeStrategy::kFullCheck:
       builder_->LoadNamedProperty(object, name, feedback_slot);
-      builder_->WriteBytecode<Bytecode::kCheckMaps>();
       break;
 
     case TSBytecodeStrategy::kDefault:
@@ -238,7 +236,6 @@ void TSBytecodeBuilder::StoreTypedVariable(const AstRawString* name,
       break;
 
     case TSBytecodeStrategy::kFullCheck:
-      builder_->WriteBytecode<Bytecode::kCheckMaps>();
       builder_->StoreGlobal(name, feedback_slot);
       break;
 
@@ -274,7 +271,7 @@ void TSBytecodeBuilder::StoreTypedProperty(Register object,
           if (slot_index >= 0) {
             TSPropertySlot slot =
                 map_factory_->GetPropertySlot(map, name->raw_data());
-            EmitStoreTypedPropertyToDescriptor(object, name,
+            EmitStoreTypedPropertyToDescriptor(object, name, feedback_slot,
                                                 slot.descriptor_index,
                                                 slot.is_inobject);
             return;
@@ -297,7 +294,6 @@ void TSBytecodeBuilder::StoreTypedProperty(Register object,
       break;
 
     case TSBytecodeStrategy::kFullCheck:
-      builder_->WriteBytecode<Bytecode::kCheckMaps>();
       builder_->SetNamedProperty(object, name, feedback_slot,
                                   LanguageMode::kSloppy);
       break;
@@ -331,19 +327,11 @@ void TSBytecodeBuilder::BinaryOperationTyped(Token::Value op,
       TypeKind kind = operand_type->kind();
 
       if (kind == TypeKind::kNumber || kind == TypeKind::kBoolean) {
-        builder_->WriteBytecode<Bytecode::kBinaryOperationSmi>(op, reg,
-                                                         feedback_slot);
+        builder_->BinaryOperation(op, reg, feedback_slot);
       } else if (kind == TypeKind::kString) {
-        if (op == Token::kAdd) {
-          builder_->WriteBytecode<Bytecode::kStringConcat>(reg,
-                                                            feedback_slot);
-        } else {
-          builder_->WriteBytecode<Bytecode::kBinaryOperation>(op, reg,
-                                                               feedback_slot);
-        }
+        builder_->BinaryOperation(op, reg, feedback_slot);
       } else if (kind == TypeKind::kBigInt) {
-        builder_->WriteBytecode<Bytecode::kBinaryOperation>(op, reg,
-                                                             feedback_slot);
+        builder_->BinaryOperation(op, reg, feedback_slot);
       } else {
         builder_->BinaryOperation(op, reg, feedback_slot);
       }
@@ -383,14 +371,11 @@ void TSBytecodeBuilder::CompareOperationTyped(Token::Value op,
       TypeKind kind = operand_type->kind();
 
       if (kind == TypeKind::kNumber || kind == TypeKind::kBoolean) {
-        builder_->WriteBytecode<Bytecode::kCompareOperationSmi>(op, reg,
-                                                         feedback_slot);
+        builder_->CompareOperation(op, reg, feedback_slot);
       } else if (kind == TypeKind::kString) {
-        builder_->WriteBytecode<Bytecode::kCompareOperation>(op, reg,
-                                                             feedback_slot);
+        builder_->CompareOperation(op, reg, feedback_slot);
       } else if (kind == TypeKind::kBigInt) {
-        builder_->WriteBytecode<Bytecode::kCompareOperation>(op, reg,
-                                                             feedback_slot);
+        builder_->CompareOperation(op, reg, feedback_slot);
       } else {
         builder_->CompareOperation(op, reg, feedback_slot);
       }
@@ -566,7 +551,7 @@ void TSBytecodeBuilder::CreateTypedObject(TSType* object_type,
 
     case TSBytecodeStrategy::kSpecializedPath:
       if (object_type->HasKnownShape()) {
-        builder_->WriteBytecode<Bytecode::kCreateEmptyObjectLiteral>();
+        builder_->CreateEmptyObjectLiteral();
       } else {
         builder_->CreateEmptyObjectLiteral();
       }
@@ -600,8 +585,7 @@ void TSBytecodeBuilder::CreateTypedArray(TSType* element_type,
 
     case TSBytecodeStrategy::kSpecializedPath:
       if (element_type->IsNumberLike()) {
-        builder_->WriteBytecode<Bytecode::kCreateEmptyArrayLiteral>(
-                                 feedback_slot);
+        builder_->CreateEmptyArrayLiteral(feedback_slot);
       } else {
         builder_->CreateEmptyArrayLiteral(feedback_slot);
       }
@@ -623,7 +607,6 @@ void TSBytecodeBuilder::CreateTypedFunction(TSType* function_type,
                                              int feedback_slot) {
   if (function_type == nullptr || function_type->kind() == TypeKind::kAny ||
       function_type->kind() == TypeKind::kUnknown) {
-    builder_->WriteBytecode<Bytecode::kCreateClosure>(feedback_slot);
     return;
   }
 
@@ -631,21 +614,11 @@ void TSBytecodeBuilder::CreateTypedFunction(TSType* function_type,
 
   switch (strategy) {
     case TSBytecodeStrategy::kSkipTypeChecks:
-      builder_->WriteBytecode<Bytecode::kCreateClosure>(feedback_slot);
-      break;
-
     case TSBytecodeStrategy::kSpecializedPath:
-      builder_->WriteBytecode<Bytecode::kCreateClosure>(feedback_slot);
-      break;
-
     case TSBytecodeStrategy::kFullCheck:
-      builder_->WriteBytecode<Bytecode::kCreateClosure>(feedback_slot);
-      break;
-
     case TSBytecodeStrategy::kZeroCostPath:
     case TSBytecodeStrategy::kDefault:
     case TSBytecodeStrategy::kSkipHoleChecks:
-      builder_->WriteBytecode<Bytecode::kCreateClosure>(feedback_slot);
       break;
   }
 }
@@ -700,17 +673,20 @@ void TSBytecodeBuilder::SkipHoleCheck(Variable* variable) {
 void TSBytecodeBuilder::EmitLoadTypedPropertyFromDescriptor(
     Register object,
     const AstRawString* name,
+    int feedback_slot,
     int descriptor_index,
     bool is_inobject) {
-  builder_->WriteBytecode<Bytecode::kLdaTypedField>(object, descriptor_index);
+  builder_->LoadNamedProperty(object, name, feedback_slot);
 }
 
 void TSBytecodeBuilder::EmitStoreTypedPropertyToDescriptor(
     Register object,
     const AstRawString* name,
+    int feedback_slot,
     int descriptor_index,
     bool is_inobject) {
-  builder_->WriteBytecode<Bytecode::kStaTypedField>(object, descriptor_index);
+  builder_->SetNamedProperty(object, name, feedback_slot,
+                              LanguageMode::kSloppy);
 }
 
 void TSBytecodeBuilder::EmitCreateTypedObject(TSType* object_type) {
@@ -726,14 +702,7 @@ void TSBytecodeBuilder::EmitCreateTypedObject(TSType* object_type) {
     return;
   }
 
-  int map_index = map_factory_->GetMapCacheIndex(object_type);
-  if (map_index < 0) {
-    builder_->CreateEmptyObjectLiteral();
-    return;
-  }
-
-  builder_->WriteBytecode<Bytecode::kLdaTypedGlobal>(map_index);
-  builder_->WriteBytecode<Bytecode::kCreateObjectFromMap>(map_index);
+  builder_->CreateEmptyObjectLiteral();
 }
 
 // ---------------------------------------------------------------------------

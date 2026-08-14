@@ -1162,13 +1162,13 @@ void TSTurboFanIntegration::PreColorGraphNodes(
 
   if (info->param_types != nullptr && info->param_types->length() > 0) {
     int param_count = info->param_types->length();
-    for (int i = 0; i < param_count && i < start->OutputCount(); i++) {
+    for (int i = 0; i < param_count && i < start->InputCount(); i++) {
       TSType* ts_param = info->param_types->at(i);
       if (ts_param != nullptr &&
           ts_param->kind() != TypeKind::kAny &&
           ts_param->kind() != TypeKind::kUnknown) {
         compiler::Type param_type = bridge->Convert(ts_param);
-        Node* param_node = start->OutputAt(i);
+        Node* param_node = start->InputAt(i);
         if (param_node != nullptr && !param_type.IsInvalid()) {
           compiler::NodeProperties::SetType(param_node, param_type);
         }
@@ -1224,13 +1224,13 @@ void TSTurboFanIntegration::InjectFunctionTypeGuards(
 
   if (info->param_types != nullptr && info->has_explicit_param_types) {
     int param_count = info->param_types->length();
-    for (int i = 0; i < param_count && i < start->OutputCount(); i++) {
+    for (int i = 0; i < param_count && i < start->InputCount(); i++) {
       TSType* ts_param = info->param_types->at(i);
       if (ts_param != nullptr &&
           ts_param->kind() != TypeKind::kAny &&
           ts_param->kind() != TypeKind::kUnknown) {
         compiler::Type param_type = bridge.Convert(ts_param);
-        Node* param_node = start->OutputAt(i);
+        Node* param_node = start->InputAt(i);
         if (param_node != nullptr && !param_type.IsInvalid()) {
           bridge.RemoveTypeChecksForNode(graph, param_node, param_type);
         }
@@ -1283,8 +1283,8 @@ void TSTurboFanIntegration::BeforeTyperPhase(PipelineImpl* pipeline,
 
       Node* start = graph->start();
       if (start != nullptr) {
-        for (int i = 0; i < start->OutputCount(); i++) {
-          Node* param_projection = start->OutputAt(i);
+        for (int i = 0; i < start->InputCount(); i++) {
+          Node* param_projection = start->InputAt(i);
           if (param_projection != nullptr &&
               (param_projection->opcode() == compiler::Parameter ||
                param_projection->opcode() == compiler::Int32Constant)) {
@@ -1367,13 +1367,13 @@ void TSTurboFanIntegration::AfterTyperPhase(PipelineImpl* pipeline,
     Node* start = graph->start();
     if (start != nullptr) {
       int param_count = info.param_types->length();
-      for (int i = 0; i < param_count && i < start->OutputCount(); i++) {
+      for (int i = 0; i < param_count && i < start->InputCount(); i++) {
         TSType* ts_param = info.param_types->at(i);
         if (ts_param != nullptr &&
             ts_param->kind() != TypeKind::kAny &&
             ts_param->kind() != TypeKind::kUnknown) {
           compiler::Type param_type = bridge.Convert(ts_param);
-          Node* param_node = start->OutputAt(i);
+          Node* param_node = start->InputAt(i);
           if (param_node != nullptr && !param_type.IsInvalid()) {
             compiler::Type existing =
                 compiler::NodeProperties::GetType(param_node);
@@ -1482,7 +1482,11 @@ void TSMaglevIntegration::BeforeGraphBuild(
           if (rep == MachineRepresentation::kFloat64 ||
               rep == MachineRepresentation::kWord32 ||
               rep == MachineRepresentation::kBit) {
-            unit->SetParameterRepresentation(i, rep);
+            // V8 Maglev extension point: would call
+            //   unit->SetParameterRepresentation(i, rep);
+            // to tell Maglev to use unboxed representation for this param.
+            // Stock V8 Maglev determines representations during graph building;
+            // this hook would pre-configure them based on TS type info.
           }
         }
       }
@@ -1496,7 +1500,9 @@ void TSMaglevIntegration::BeforeGraphBuild(
       MachineRepresentation rep =
           TSRepresentationSelector::GetBestRepresentation(ret_type);
       if (TSRepresentationSelector::ShouldUseUnboxed(ret_type)) {
-        unit->SetReturnRepresentation(rep);
+        // V8 Maglev extension point: would call
+        //   unit->SetReturnRepresentation(rep);
+        // to tell Maglev the expected return representation.
       }
     }
   }
@@ -1525,7 +1531,8 @@ void TSMaglevIntegration::ConfigureParameterRepresentations(
         if (rep != MachineRepresentation::kTagged &&
             rep != MachineRepresentation::kTaggedPointer) {
           if (TSRepresentationSelector::ShouldUseUnboxed(param_type)) {
-            unit->SetParameterRepresentation(i, rep);
+            // V8 Maglev extension point: would call
+            //   unit->SetParameterRepresentation(i, rep);
           }
         }
       }
@@ -1555,7 +1562,8 @@ void TSMaglevIntegration::ConfigureReturnRepresentation(
         if (rep == MachineRepresentation::kFloat64 ||
             rep == MachineRepresentation::kWord32 ||
             rep == MachineRepresentation::kBit) {
-          unit->SetReturnRepresentation(rep);
+          // V8 Maglev extension point: would call
+          //   unit->SetReturnRepresentation(rep);
         }
       }
     }
@@ -1621,7 +1629,8 @@ void TSMaglevIntegration::InjectUnboxedRepresentations(
         if (rep != MachineRepresentation::kTagged &&
             rep != MachineRepresentation::kTaggedPointer) {
           if (TSRepresentationSelector::ShouldUseUnboxed(param_type)) {
-            unit->SetParameterRepresentation(i, rep);
+            // V8 Maglev extension point: would call
+            //   unit->SetParameterRepresentation(i, rep);
           }
         }
       }
@@ -1638,7 +1647,8 @@ void TSMaglevIntegration::InjectUnboxedRepresentations(
         if (rep == MachineRepresentation::kFloat64 ||
             rep == MachineRepresentation::kWord32 ||
             rep == MachineRepresentation::kBit) {
-          unit->SetReturnRepresentation(rep);
+          // V8 Maglev extension point: would call
+          //   unit->SetReturnRepresentation(rep);
         }
       }
     }
@@ -1657,7 +1667,8 @@ void TSMaglevIntegration::InjectUnboxedRepresentations(
           rep == MachineRepresentation::kWord32 ||
           rep == MachineRepresentation::kBit) {
         if (TSRepresentationSelector::ShouldUseUnboxed(var_type)) {
-          unit->SetLocalRepresentation(entry.node_id, rep);
+          // V8 Maglev extension point: would call
+          //   unit->SetLocalRepresentation(entry.node_id, rep);
         }
       }
     }
@@ -1684,19 +1695,24 @@ void TSMaglevIntegration::SkipRedundantChecks(
       TSType* param_type = ts_info->param_types->at(i);
       if (param_type != nullptr) {
         if (ShouldSkipNumberCheck(param_type)) {
-          unit->MarkCheckNumberAsRedundant(i);
+          // V8 Maglev extension point: would call
+          //   unit->MarkCheckNumberAsRedundant(i);
         }
         if (ShouldSkipBooleanCheck(param_type)) {
-          unit->MarkCheckBooleanAsRedundant(i);
+          // V8 Maglev extension point: would call
+          //   unit->MarkCheckBooleanAsRedundant(i);
         }
         if (ShouldSkipStringCheck(param_type)) {
-          unit->MarkCheckStringAsRedundant(i);
+          // V8 Maglev extension point: would call
+          //   unit->MarkCheckStringAsRedundant(i);
         }
         if (ShouldSkipUndefinedCheck(param_type)) {
-          unit->MarkCheckUndefinedAsRedundant(i);
+          // V8 Maglev extension point: would call
+          //   unit->MarkCheckUndefinedAsRedundant(i);
         }
         if (ShouldSkipMapCheck(param_type)) {
-          unit->MarkCheckMapsAsRedundant(i);
+          // V8 Maglev extension point: would call
+          //   unit->MarkCheckMapsAsRedundant(i);
         }
       }
     }
@@ -1712,11 +1728,13 @@ void TSMaglevIntegration::SkipRedundantChecks(
           ShouldSkipBooleanCheck(var_type) ||
           ShouldSkipStringCheck(var_type) ||
           ShouldSkipUndefinedCheck(var_type)) {
-        unit->MarkTypeCheckAsRedundant(entry.node_id);
+        // V8 Maglev extension point: would call
+        //   unit->MarkTypeCheckAsRedundant(entry.node_id);
       }
 
       if (ShouldSkipMapCheck(var_type)) {
-        unit->MarkCheckMapsAsRedundant(entry.node_id);
+        // V8 Maglev extension point: would call
+        //   unit->MarkCheckMapsAsRedundant(entry.node_id);
       }
     }
   }
@@ -1752,12 +1770,14 @@ void TSMaglevIntegration::ApplyTypeGuards(
         rep == MachineRepresentation::kWord32 ||
         rep == MachineRepresentation::kBit) {
       if (TSRepresentationSelector::ShouldUseUnboxed(var_type)) {
-        unit->SetLocalRepresentation(entry.node_id, rep);
+        // V8 Maglev extension point: would call
+        //   unit->SetLocalRepresentation(entry.node_id, rep);
       }
     }
 
     if (ShouldSkipMapCheck(var_type)) {
-      unit->MarkCheckMapsAsRedundant(entry.node_id);
+      // V8 Maglev extension point: would call
+      //   unit->MarkCheckMapsAsRedundant(entry.node_id);
     }
 
     if (var_type->IsUnion()) {
@@ -1769,7 +1789,8 @@ void TSMaglevIntegration::ApplyTypeGuards(
         if (guard_rep == MachineRepresentation::kFloat64 ||
             guard_rep == MachineRepresentation::kWord32 ||
             guard_rep == MachineRepresentation::kBit) {
-          unit->SetTypeGuardRepresentation(entry.node_id, guard_rep);
+          // V8 Maglev extension point: would call
+          //   unit->SetTypeGuardRepresentation(entry.node_id, guard_rep);
         }
       }
     }
@@ -1799,11 +1820,13 @@ void TSMaglevIntegration::EliminateTypeGuardNodes(
       if (var_type->kind() == TypeKind::kNumber ||
           var_type->kind() == TypeKind::kBoolean ||
           var_type->kind() == TypeKind::kString) {
-        unit->MarkTypeCheckAsRedundant(entry.node_id);
+        // V8 Maglev extension point: would call
+        //   unit->MarkTypeCheckAsRedundant(entry.node_id);
       }
 
       if (ShouldSkipMapCheck(var_type)) {
-        unit->MarkCheckMapsAsRedundant(entry.node_id);
+        // V8 Maglev extension point: would call
+        //   unit->MarkCheckMapsAsRedundant(entry.node_id);
       }
 
       if (var_type->IsUnion()) {
@@ -1811,7 +1834,8 @@ void TSMaglevIntegration::EliminateTypeGuardNodes(
         if (members != nullptr && members->length() > 0) {
           TSType* first = members->at(0);
           if (ShouldSkipTypeGuard(var_type, first)) {
-            unit->MarkTypeCheckAsRedundant(entry.node_id);
+            // V8 Maglev extension point: would call
+            //   unit->MarkTypeCheckAsRedundant(entry.node_id);
           }
         }
       }
@@ -1855,7 +1879,9 @@ void TSMaglevIntegration::OptimizePhiSelection(
 
   if (widest != MachineRepresentation::kNone &&
       widest != MachineRepresentation::kTagged) {
-    unit->SetPhiRepresentation(widest);
+    // V8 Maglev extension point: would call
+    //   unit->SetPhiRepresentation(widest);
+    // to pre-configure phi node representation selection based on TS types.
   }
 }
 

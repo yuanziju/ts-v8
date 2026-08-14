@@ -277,7 +277,7 @@ TSType* TSTypeChecker::InferCallType(Call* call) {
   }
 
   if (callee_type->IsFunction()) {
-    FunctionType* func_type = callee_type->AsFunctionType();
+    TSType* func_type = callee_type->AsFunctionType();
     const ZoneList<TSType*>* param_types = func_type->ParameterTypes();
     int param_count = param_types ? param_types->size() : 0;
     const ZonePtrList<Expression>* args = call->arguments();
@@ -304,7 +304,7 @@ TSType* TSTypeChecker::InferCallType(Call* call) {
   }
 
   if (callee_type->IsUnion()) {
-    UnionType* union_type = callee_type->AsUnionType();
+    TSType* union_type = callee_type->AsUnionType();
     TSType* last_return = type_system_->GetAnyType();
     bool has_valid_overload = false;
     for (int i = 0; i < union_type->arity(); i++) {
@@ -318,7 +318,7 @@ TSType* TSTypeChecker::InferCallType(Call* call) {
   }
 
   if (callee_type->IsConditionalType()) {
-    ConditionalType* cond_type = callee_type->AsConditionalType();
+    TSType* cond_type = callee_type->AsConditionalType();
     return cond_type->DefaultType();
   }
 
@@ -337,12 +337,12 @@ TSType* TSTypeChecker::InferPropertyLoadType(Property* prop) {
   }
 
   if (obj_type->IsUnion()) {
-    UnionType* union_type = obj_type->AsUnionType();
+    TSType* union_type = obj_type->AsUnionType();
     TSType* result = nullptr;
     for (int i = 0; i < union_type->arity(); i++) {
       TSType* constituent = union_type->type_at(i);
       if (constituent->IsObject()) {
-        ObjectType* obj = constituent->AsObjectType();
+        TSType* obj = constituent->AsObjectType();
         const AstRawString* prop_name = nullptr;
         if (key->IsVariableProxy()) {
           prop_name = key->AsVariableProxy()->raw_name();
@@ -370,7 +370,7 @@ TSType* TSTypeChecker::InferPropertyLoadType(Property* prop) {
   }
 
   if (obj_type->IsObject()) {
-    ObjectType* obj = obj_type->AsObjectType();
+    TSType* obj = obj_type->AsObjectType();
     const AstRawString* prop_name = nullptr;
     if (key->IsVariableProxy()) {
       prop_name = key->AsVariableProxy()->raw_name();
@@ -410,12 +410,12 @@ TSType* TSTypeChecker::InferPropertyLoadType(Property* prop) {
   }
 
   if (obj_type->IsArray()) {
-    ArrayType* arr_type = obj_type->AsArrayType();
+    TSType* arr_type = obj_type->AsArrayType();
     if (key->IsLiteral()) {
       Literal* lit = key->AsLiteral();
       if (lit->type() == Literal::kSmi ||
           lit->type() == Literal::kHeapNumber) {
-        return arr_type->ElementType();
+        return arr_type->GetElementType();
       }
       if (lit->type() == Literal::kString ||
           lit->type() == Literal::kConsString) {
@@ -437,7 +437,7 @@ TSType* TSTypeChecker::InferPropertyLoadType(Property* prop) {
         return type_system_->GetFunctionType();
       }
     }
-    return arr_type->ElementType();
+    return arr_type->GetElementType();
   }
 
   if (obj_type->IsFunction()) {
@@ -555,7 +555,7 @@ TSType* TSTypeChecker::InferMemberAccessType(Expression* object,
   for (int i = context_stack_.size() - 1; i >= 0; i--) {
     TSType* ctx_type = context_stack_.at(i);
     if (ctx_type->IsObject()) {
-      ObjectType* obj = ctx_type->AsObjectType();
+      TSType* obj = ctx_type->AsObjectType();
       PropertyDescriptor* desc = obj->GetProperty(name);
       if (desc != nullptr) return desc->GetType();
     }
@@ -837,7 +837,7 @@ bool TSTypeChecker::CheckCall(TSType* callee_type,
     return false;
   }
 
-  FunctionType* func_type = callee_type->AsFunctionType();
+  TSType* func_type = callee_type->AsFunctionType();
   const ZoneList<TSType*>* param_types = func_type->ParameterTypes();
   int param_count = param_types ? param_types->size() : 0;
   int arg_count = arg_types ? arg_types->size() : 0;
@@ -866,7 +866,7 @@ bool TSTypeChecker::CheckCall(TSType* callee_type,
 }
 
 bool TSTypeChecker::CheckPropertyAccess(TSType* object_type,
-                                         const char* property_name) {
+                                         const AstRawString* property_name) {
   if (object_type == nullptr) {
     ReportError("Cannot access property on null type", kNoSourcePosition);
     return false;
@@ -875,10 +875,10 @@ bool TSTypeChecker::CheckPropertyAccess(TSType* object_type,
   if (object_type->IsAny()) return true;
 
   if (object_type->IsObject()) {
-    ObjectType* obj = object_type->AsObjectType();
+    TSType* obj = object_type->AsObjectType();
     bool found = obj->HasProperty(property_name);
     if (!found && strict_mode_) {
-      ReportError("Property '" + std::string(property_name) +
+      ReportError("Property '" + std::string(property_name->c_str()) +
                       "' does not exist on type '" +
                       std::string(object_type->Name()) + "'",
                   kNoSourcePosition);
@@ -1217,7 +1217,7 @@ TSType* TSTypeChecker::NarrowFromEquality(TSType* type,
       return type_system_->GetNullType();
     } else {
       if (type->IsUnion()) {
-        return type->AsUnionType()->ExcludeNull();
+        return type->AsUnionType()->ExcludeNull(zone_);
       }
       if (type->IsNull()) {
         return type_system_->GetNeverType();
@@ -1231,7 +1231,7 @@ TSType* TSTypeChecker::NarrowFromEquality(TSType* type,
       return type_system_->GetUndefinedType();
     } else {
       if (type->IsUnion()) {
-        return type->AsUnionType()->ExcludeUndefined();
+        return type->AsUnionType()->ExcludeUndefined(zone_);
       }
       if (type->IsUndefined()) {
         return type_system_->GetNeverType();
@@ -1276,7 +1276,7 @@ TSType* TSTypeChecker::NarrowFromTruthiness(TSType* type,
   if (type == nullptr) return type;
 
   if (type->IsUnion()) {
-    UnionType* union_type = type->AsUnionType();
+    TSType* union_type = type->AsUnionType();
     ZoneList<TSType*>* narrowed =
         new (zone_) ZoneList<TSType*>(union_type->arity(), zone_);
 
@@ -1708,7 +1708,7 @@ bool TSTypeChecker::IsAssignableTo(TSType* source, TSType* target) {
   }
 
   if (source->IsUnion()) {
-    UnionType* union_source = source->AsUnionType();
+    TSType* union_source = source->AsUnionType();
     for (int i = 0; i < union_source->arity(); i++) {
       if (!IsAssignableTo(union_source->type_at(i), target)) {
         return false;
@@ -1718,7 +1718,7 @@ bool TSTypeChecker::IsAssignableTo(TSType* source, TSType* target) {
   }
 
   if (target->IsUnion()) {
-    UnionType* union_target = target->AsUnionType();
+    TSType* union_target = target->AsUnionType();
     for (int i = 0; i < union_target->arity(); i++) {
       if (IsAssignableTo(source, union_target->type_at(i))) {
         return true;
@@ -1728,7 +1728,7 @@ bool TSTypeChecker::IsAssignableTo(TSType* source, TSType* target) {
   }
 
   if (source->IsIntersection()) {
-    IntersectionType* intersection = source->AsIntersectionType();
+    TSType* intersection = source->AsIntersectionType();
     for (int i = 0; i < intersection->arity(); i++) {
       if (IsAssignableTo(intersection->type_at(i), target)) {
         return true;
@@ -1738,7 +1738,7 @@ bool TSTypeChecker::IsAssignableTo(TSType* source, TSType* target) {
   }
 
   if (target->IsIntersection()) {
-    IntersectionType* intersection = target->AsIntersectionType();
+    TSType* intersection = target->AsIntersectionType();
     for (int i = 0; i < intersection->arity(); i++) {
       if (!IsAssignableTo(source, intersection->type_at(i))) {
         return false;
@@ -1752,8 +1752,8 @@ bool TSTypeChecker::IsAssignableTo(TSType* source, TSType* target) {
   }
 
   if (source->IsFunction() && target->IsFunction()) {
-    FunctionType* src_func = source->AsFunctionType();
-    FunctionType* tgt_func = target->AsFunctionType();
+    TSType* src_func = source->AsFunctionType();
+    TSType* tgt_func = target->AsFunctionType();
 
     const ZoneList<TSType*>* src_params = src_func->ParameterTypes();
     const ZoneList<TSType*>* tgt_params = tgt_func->ParameterTypes();
@@ -1777,10 +1777,10 @@ bool TSTypeChecker::IsAssignableTo(TSType* source, TSType* target) {
   }
 
   if (source->IsArray() && target->IsArray()) {
-    ArrayType* src_arr = source->AsArrayType();
-    ArrayType* tgt_arr = target->AsArrayType();
-    return IsAssignableTo(src_arr->ElementType(),
-                          tgt_arr->ElementType());
+    TSType* src_arr = source->AsArrayType();
+    TSType* tgt_arr = target->AsArrayType();
+    return IsAssignableTo(src_arr->GetElementType(),
+                          tgt_arr->GetElementType());
   }
 
   if (source->IsArray() && target->IsObject()) {
@@ -1802,8 +1802,8 @@ bool TSTypeChecker::IsAssignableTo(TSType* source, TSType* target) {
 bool TSTypeChecker::IsStructuralSubtype(TSType* source, TSType* target) {
   if (!source->IsObject() || !target->IsObject()) return false;
 
-  ObjectType* src_obj = source->AsObjectType();
-  ObjectType* tgt_obj = target->AsObjectType();
+  TSType* src_obj = source->AsObjectType();
+  TSType* tgt_obj = target->AsObjectType();
 
   ZoneList<PropertyDescriptor*>* target_props = tgt_obj->Properties();
   if (target_props == nullptr) return true;

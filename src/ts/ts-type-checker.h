@@ -26,7 +26,7 @@ class TSTypeChecker : public ZoneObject {
 
   bool CheckCall(TSType* callee_type, ZoneList<TSType*>* arg_types);
 
-  bool CheckPropertyAccess(TSType* object_type, const char* property_name);
+  bool CheckPropertyAccess(TSType* object_type, const AstRawString* property_name);
 
   bool CheckReturn(TSType* function_return_type, Expression* return_value);
 

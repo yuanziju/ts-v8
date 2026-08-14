@@ -228,8 +228,8 @@ class TSType : public ZoneObject {
   ZoneList<TSType*>* union_types() const { return union_members_; }
   ZoneList<TSType*>* GetUnionMembers() const { return union_members_; }
 
-  TSType* AsArrayType() const { return element_type_; }
   TSType* GetElementType() const { return element_type_; }
+  TSType* ElementType() const { return element_type_; }
 
   const char* GetName() const { return name_; }
 

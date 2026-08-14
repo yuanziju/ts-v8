@@ -453,14 +453,14 @@ bool TSFieldType::IsGuaranteedStable() const {
 TSMapFactory::TSMapFactory(Isolate* isolate)
     : isolate_(isolate),
       cached_maps_(0, nullptr),
-      metadata_table_(nullptr) {}
+      metadata_table_(16, nullptr) {}
 
 // ---------------------------------------------------------------------------
 // TSMapFactory – Create an empty Map
 // ---------------------------------------------------------------------------
 
 Handle<Map> TSMapFactory::CreateEmptyMap() {
-  Handle<Map> map = Map::Create(isolate_, 0);
+  Handle<Map> map = isolate_->factory()->NewMap();
   return map;
 }
 
@@ -477,7 +477,7 @@ Handle<Map> TSMapFactory::CreateMapWithDescriptors(
     return CreateEmptyMap();
   }
 
-  Handle<Map> map = Map::Create(isolate_, props->length());
+  Handle<Map> map = isolate_->factory()->NewMap();
 
   Handle<Map> current = map;
   for (int i = 0; i < props->length(); i++) {
@@ -495,7 +495,7 @@ Handle<Map> TSMapFactory::CreateMapWithDescriptors(
         prop.is_readonly ? PropertyConstness::kConst
                          : PropertyConstness::kMutable;
 
-    Handle<FieldType> field_type = FieldType::Any(isolate_);
+    Handle<FieldType> field_type = handle(FieldType::Any(), isolate_);
 
     MaybeHandle<Map> result = Map::CopyWithField(
         isolate_, current, name_as_name, field_type, attrs, constness, repr,
@@ -521,7 +521,7 @@ void TSMapFactory::SetInobjectProperties(Handle<Map> map, int count) {
   int instance_size = JSObject::kHeaderSize + kTaggedSize * count;
   map->set_instance_size(instance_size);
   map->SetInObjectPropertiesStartInWords(JSObject::kHeaderSize / kTaggedSize);
-  map->SetInObjectUnusedPropertyFields(count);
+  map->set_unused_property_fields(count);
 }
 
 // ---------------------------------------------------------------------------
@@ -571,13 +571,13 @@ Handle<Map> TSMapFactory::CreateMapFromType(TSType* type, Zone* zone) {
     case TypeKind::kObject:
     case TypeKind::kFunction:
     case TypeKind::kPromise: {
-      Handle<Map> map = Map::Create(isolate_, 0);
+      Handle<Map> map = isolate_->factory()->NewMap();
       TSMapMetadata* metadata = zone->New<TSMapMetadata>();
       metadata->ts_type = type;
       metadata->is_stable_by_ts = type->IsStable();
       metadata->expected_property_count = type->GetPropertyCount();
       metadata->creation_order = static_cast<int>(cached_maps_.length());
-      AttachMetadata(map, metadata);
+      AttachMetadata(map, metadata, zone);
       return map;
     }
 
@@ -614,30 +614,30 @@ Handle<Map> TSMapFactory::CreateMapFromType(TSType* type, Zone* zone) {
         metadata->is_stable_by_ts = type->IsStable();
         metadata->expected_property_count = props->length();
         metadata->creation_order = static_cast<int>(cached_maps_.length());
-        AttachMetadata(map, metadata);
+        AttachMetadata(map, metadata, zone);
         cached_maps_.Add(map, zone);
         return map;
       }
 
       if (type->kind() == TypeKind::kArray && type->GetElementType() != nullptr) {
-        Handle<Map> map = Map::Create(isolate_, 1);
+        Handle<Map> map = isolate_->factory()->NewMap();
         TSMapMetadata* metadata = zone->New<TSMapMetadata>();
         metadata->ts_type = type;
         metadata->is_stable_by_ts = type->IsStable();
         metadata->expected_property_count = 1;
         metadata->creation_order = static_cast<int>(cached_maps_.length());
-        AttachMetadata(map, metadata);
+        AttachMetadata(map, metadata, zone);
         cached_maps_.Add(map, zone);
         return map;
       }
 
-      Handle<Map> map = Map::Create(isolate_, 0);
+      Handle<Map> map = isolate_->factory()->NewMap();
       TSMapMetadata* metadata = zone->New<TSMapMetadata>();
       metadata->ts_type = type;
       metadata->is_stable_by_ts = type->IsStable();
       metadata->expected_property_count = 0;
       metadata->creation_order = static_cast<int>(cached_maps_.length());
-      AttachMetadata(map, metadata);
+      AttachMetadata(map, metadata, zone);
       cached_maps_.Add(map, zone);
       return map;
     }
@@ -698,7 +698,7 @@ Handle<Map> TSMapFactory::CreateStableMap(TSType* type, Zone* zone) {
   metadata->is_stable_by_ts = true;
   metadata->is_pre_allocated = true;
 
-  AttachMetadata(map, metadata);
+  AttachMetadata(map, metadata, zone);
 
   SetFieldsAsReadonly(map);
 
@@ -710,15 +710,12 @@ Handle<Map> TSMapFactory::CreateStableMap(TSType* type, Zone* zone) {
 // ---------------------------------------------------------------------------
 
 void TSMapFactory::AttachMetadata(Handle<Map> map,
-                                  TSMapMetadata* metadata) {
+                                  TSMapMetadata* metadata,
+                                  Zone* zone) {
   DCHECK_NOT_NULL(map);
   DCHECK_NOT_NULL(metadata);
 
-  if (metadata_table_ == nullptr) {
-    metadata_table_ = new ZoneList<TSMapMetadata*>(16, nullptr);
-  }
-
-  metadata_table_->Add(metadata, nullptr);
+  metadata_table_.Add(metadata, zone);
 
   map->set_bit_field3(map->bit_field3() |
                       (1u << kTSTypeMetadataBit));
@@ -731,15 +728,13 @@ void TSMapFactory::AttachMetadata(Handle<Map> map,
 TSMapMetadata* TSMapFactory::GetMetadata(Handle<Map> map) {
   DCHECK_NOT_NULL(map);
 
-  if (metadata_table_ == nullptr) return nullptr;
-
   uint32_t bit_field3 = map->bit_field3();
   if (!(bit_field3 & (1u << kTSTypeMetadataBit))) {
     return nullptr;
   }
 
-  for (int i = metadata_table_->length() - 1; i >= 0; i--) {
-    TSMapMetadata* md = metadata_table_->at(i);
+  for (int i = metadata_table_.length() - 1; i >= 0; i--) {
+    TSMapMetadata* md = metadata_table_.at(i);
     if (md != nullptr && md->ts_type != nullptr) {
       return md;
     }
@@ -770,7 +765,7 @@ Handle<Map> TSMapFactory::CreateSpecializedTransition(
   PropertyAttributes attrs = NONE;
   PropertyConstness constness = PropertyConstness::kMutable;
 
-  Handle<FieldType> field_type = FieldType::Any(isolate_);
+  Handle<FieldType> field_type = handle(FieldType::Any(), isolate_);
 
   MaybeHandle<Map> result = Map::CopyWithField(
       isolate_, from_map, name_as_name, field_type, attrs, constness, repr,
@@ -797,7 +792,7 @@ Handle<Map> TSMapFactory::CreateSpecializedTransition(
         }
       }
 
-      AttachMetadata(new_map, new_metadata);
+      AttachMetadata(new_map, new_metadata, zone);
     }
 
     return new_map;
@@ -1279,7 +1274,7 @@ TSPropertySlot TSMapFactory::GetPropertySlot(Handle<Map> map,
   slot.representation = slot.details.representation();
 
   int first_inobject =
-      map->GetInObjectPropertiesStartInWords() * kTaggedSize / kTaggedSize;
+      map->GetInObjectPropertiesStartInWords();
   int inobject_count = GetInObjectPropertyCount(map);
 
   if (index < inobject_count) {
@@ -1308,7 +1303,7 @@ Handle<Object> TSMapFactory::LoadFromDescriptor(Handle<JSObject> obj,
                                                   bool is_inobject) {
   DCHECK_NOT_NULL(obj);
 
-  Handle<Map> map = Handle<Map>(obj->map());
+  Handle<Map> map = handle(obj->map(), isolate_);
   Tagged<DescriptorArray> descriptors =
       Cast<DescriptorArray>(map->instance_descriptors());
   InternalIndex idx(index);
@@ -1387,7 +1382,7 @@ void TSMapFactory::StoreToDescriptor(Handle<JSObject> obj,
   DCHECK_NOT_NULL(obj);
   DCHECK_NOT_NULL(value);
 
-  Handle<Map> map = Handle<Map>(obj->map());
+  Handle<Map> map = handle(obj->map(), isolate_);
   Tagged<DescriptorArray> descriptors =
       Cast<DescriptorArray>(map->instance_descriptors());
   InternalIndex idx(index);
@@ -1478,7 +1473,7 @@ Handle<Object> TSMapFactory::LoadTypedProperty(
   DCHECK_NOT_NULL(obj);
   DCHECK_NOT_NULL(property_name);
 
-  Handle<Map> map = Handle<Map>(obj->map());
+  Handle<Map> map = handle(obj->map(), isolate_);
   TSPropertySlot slot = GetPropertySlot(map, property_name);
 
   if (slot.descriptor_index < 0) {
@@ -1502,7 +1497,7 @@ void TSMapFactory::StoreTypedProperty(Handle<JSObject> obj,
   DCHECK_NOT_NULL(property_name);
   DCHECK_NOT_NULL(value);
 
-  Handle<Map> map = Handle<Map>(obj->map());
+  Handle<Map> map = handle(obj->map(), isolate_);
   TSPropertySlot slot = GetPropertySlot(map, property_name);
 
   if (slot.descriptor_index < 0) {
@@ -1620,7 +1615,7 @@ Handle<JSObject> TSObjectAllocator::AllocateWithValues(
   Handle<JSObject> obj = map_factory_->AllocateTypedObject(type, zone);
   if (obj.is_null()) return obj;
 
-  Handle<Map> map = Handle<Map>(obj->map());
+  Handle<Map> map = handle(obj->map(), isolate_);
   int inobject_count = map_factory_->GetInObjectPropertyCount(map);
 
   int count = initial_values->length();

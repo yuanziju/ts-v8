@@ -95,10 +95,12 @@ class TSBytecodeBuilder {
 
   void EmitLoadTypedPropertyFromDescriptor(Register object,
                                             const AstRawString* name,
+                                            int feedback_slot,
                                             int descriptor_index,
                                             bool is_inobject);
   void EmitStoreTypedPropertyToDescriptor(Register object,
                                            const AstRawString* name,
+                                           int feedback_slot,
                                            int descriptor_index,
                                            bool is_inobject);
   void EmitCreateTypedObject(TSType* object_type);
