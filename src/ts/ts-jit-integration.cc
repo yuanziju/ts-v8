@@ -4,6 +4,9 @@
 
 #include "src/ts/ts-jit-integration.h"
 
+#include <cstring>
+#include <utility>
+
 #include "src/base/logging.h"
 #include "src/codegen/machine-type.h"
 #include "src/compiler/node-properties.h"
@@ -31,7 +34,7 @@ class PipelineImpl;
 namespace ts {
 
 // ---------------------------------------------------------------------------
-// TypeInfoForJIT - Data population
+// TypeInfoForJIT - Data population with real TS type data
 // ---------------------------------------------------------------------------
 
 void TypeInfoForJIT::PopulateFromTypeSystem(TSTypeSystem* type_system,
@@ -40,7 +43,6 @@ void TypeInfoForJIT::PopulateFromTypeSystem(TSTypeSystem* type_system,
 
   is_populated = true;
   is_strict = true;
-  should_skip_type_checks = true;
 
   if (variable_types == nullptr) {
     variable_types = zone->New<ZoneList<VariableTypeEntry>>(0, zone);
@@ -71,12 +73,9 @@ void TypeInfoForJIT::PopulateFromTypeSystem(TSTypeSystem* type_system,
     has_explicit_param_types = false;
   }
 
-  if (return_type != nullptr &&
-      (return_type->kind() == TypeKind::kAny ||
-       return_type->kind() == TypeKind::kUnknown)) {
-    should_skip_type_checks = false;
-  }
-  if (!has_explicit_return_type && !has_explicit_param_types) {
+  if (has_explicit_return_type || has_explicit_param_types) {
+    should_skip_type_checks = true;
+  } else {
     should_skip_type_checks = false;
   }
 
@@ -111,7 +110,7 @@ TSType* TypeInfoForJIT::GetNodeType(int node_id) const {
 }
 
 // ---------------------------------------------------------------------------
-// TSToTurboFanBridge
+// TSToTurboFanBridge - Construction
 // ---------------------------------------------------------------------------
 
 TSToTurboFanBridge::TSToTurboFanBridge(JSHeapBroker* broker, Zone* zone)
@@ -119,6 +118,10 @@ TSToTurboFanBridge::TSToTurboFanBridge(JSHeapBroker* broker, Zone* zone)
       zone_(zone),
       conversion_cache_(
           zone->New<ZoneList<std::pair<TSType*, compiler::Type>>>(0, zone)) {}
+
+// ---------------------------------------------------------------------------
+// TSToTurboFanBridge::Convert - Main TS->TurboFan type dispatch
+// ---------------------------------------------------------------------------
 
 compiler::Type TSToTurboFanBridge::Convert(TSType* ts_type) {
   if (ts_type == nullptr) return compiler::Type::Any();
@@ -142,6 +145,8 @@ compiler::Type TSToTurboFanBridge::Convert(TSType* ts_type) {
     case TypeKind::kAny:
     case TypeKind::kUnknown:
     case TypeKind::kNever:
+    case TypeKind::kTrue:
+    case TypeKind::kFalse:
       result = ConvertPrimitive(ts_type);
       break;
 
@@ -163,6 +168,7 @@ compiler::Type TSToTurboFanBridge::Convert(TSType* ts_type) {
       break;
 
     case TypeKind::kFunction:
+    case TypeKind::kConstructor:
       result = ConvertFunction(ts_type);
       break;
 
@@ -202,9 +208,15 @@ compiler::Type TSToTurboFanBridge::Convert(TSType* ts_type) {
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// TSToTurboFanBridge::ConvertPrimitive
+// ---------------------------------------------------------------------------
+
 compiler::Type TSToTurboFanBridge::ConvertPrimitive(TSType* ts_type) {
   switch (ts_type->kind()) {
     case TypeKind::kBoolean:
+    case TypeKind::kTrue:
+    case TypeKind::kFalse:
       return compiler::Type::Boolean();
     case TypeKind::kNumber:
       return compiler::Type::Number();
@@ -231,22 +243,160 @@ compiler::Type TSToTurboFanBridge::ConvertPrimitive(TSType* ts_type) {
   }
 }
 
-compiler::Type TSToTurboFanBridge::ConvertObject(TSType* ts_type) {
-  if (ts_type->kind() == TypeKind::kPromise) {
-    return compiler::Type::Receiver();
+// ---------------------------------------------------------------------------
+// TSToTurboFanBridge::NumericTypeFromTS - Extract numeric precision info
+// ---------------------------------------------------------------------------
+
+compiler::Type TSToTurboFanBridge::NumericTypeFromTS(TSType* ts_type) {
+  if (ts_type == nullptr) return compiler::Type::Number();
+
+  if (ts_type->kind() == TypeKind::kNumber) {
+    return compiler::Type::Number();
   }
-  if (ts_type->kind() == TypeKind::kRecord) {
-    return compiler::Type::Object();
+
+  if (ts_type->kind() == TypeKind::kBoolean ||
+      ts_type->kind() == TypeKind::kTrue ||
+      ts_type->kind() == TypeKind::kFalse) {
+    return compiler::Type::Boolean();
   }
-  if (ts_type->kind() == TypeKind::kPartial ||
-      ts_type->kind() == TypeKind::kRequired ||
-      ts_type->kind() == TypeKind::kReadonly ||
-      ts_type->kind() == TypeKind::kPick ||
-      ts_type->kind() == TypeKind::kOmit) {
-    return compiler::Type::Object();
+
+  if (ts_type->kind() == TypeKind::kLiteral) {
+    const char* lit = ts_type->GetName();
+    if (lit != nullptr) {
+      char* end = nullptr;
+      double val = strtod(lit, &end);
+      if (end != lit && *end == '\0') {
+        return compiler::Type::Constant(val, zone_);
+      }
+    }
+    return compiler::Type::Number();
   }
-  return compiler::Type::Object();
+
+  if (ts_type->IsUnion()) {
+    ZoneList<TSType*>* members = ts_type->union_types();
+    if (members != nullptr && members->length() > 0) {
+      compiler::Type result = NumericTypeFromTS(members->at(0));
+      for (int i = 1; i < members->length(); i++) {
+        result = compiler::Type::Union(result, NumericTypeFromTS(members->at(i)),
+                                       zone_);
+      }
+      return result;
+    }
+  }
+
+  return compiler::Type::Number();
 }
+
+// ---------------------------------------------------------------------------
+// TSToTurboFanBridge::ConstructTypedObjectShape
+//   Uses HasKnownShape() and the property list to construct typed object
+//   shapes with internal property type annotations, instead of returning
+//   a generic Object() type for all objects.
+// ---------------------------------------------------------------------------
+
+compiler::Type TSToTurboFanBridge::ConstructTypedObjectShape(TSType* ts_type) {
+  if (ts_type == nullptr) return compiler::Type::Object();
+
+  if (!ts_type->HasKnownShape()) {
+    return compiler::Type::Object();
+  }
+
+  ZoneList<PropertyDescriptor>* props = ts_type->GetProperties();
+  if (props == nullptr || props->length() == 0) {
+    return compiler::Type::Object();
+  }
+
+  compiler::Type base = compiler::Type::Object();
+
+  int concrete_props = 0;
+  for (int i = 0; i < props->length(); i++) {
+    const PropertyDescriptor& prop = props->at(i);
+    if (prop.type != nullptr &&
+        prop.type->kind() != TypeKind::kAny &&
+        prop.type->kind() != TypeKind::kUnknown) {
+      compiler::Type prop_compiler_type = Convert(prop.type);
+      if (!prop_compiler_type.IsInvalid()) {
+        base = compiler::Type::Intersect(base, prop_compiler_type, zone_);
+        concrete_props++;
+      }
+    }
+  }
+
+  if (concrete_props == 0) {
+    return compiler::Type::Object();
+  }
+
+  return base;
+}
+
+// ---------------------------------------------------------------------------
+// TSToTurboFanBridge::ConvertObject
+//   NOW uses HasKnownShape() and property list to construct typed object
+//   shapes with internal property type annotations, rather than returning
+//   a plain compiler::Type::Object() for all object types.
+// ---------------------------------------------------------------------------
+
+compiler::Type TSToTurboFanBridge::ConvertObject(TSType* ts_type) {
+  if (ts_type == nullptr) return compiler::Type::Object();
+
+  switch (ts_type->kind()) {
+    case TypeKind::kPromise: {
+      TSType* elem = ts_type->GetElementType();
+      if (elem != nullptr && elem->kind() != TypeKind::kAny &&
+          elem->kind() != TypeKind::kUnknown) {
+        compiler::Type elem_type = Convert(elem);
+        if (!elem_type.IsInvalid()) {
+          return compiler::Type::Intersect(compiler::Type::Receiver(),
+                                           elem_type, zone_);
+        }
+      }
+      return compiler::Type::Receiver();
+    }
+
+    case TypeKind::kRecord: {
+      TSType* value_type = ts_type->GetElementType();
+      if (value_type != nullptr && value_type->kind() != TypeKind::kAny) {
+        compiler::Type val = Convert(value_type);
+        if (!val.IsInvalid()) {
+          return compiler::Type::Intersect(compiler::Type::Object(), val,
+                                           zone_);
+        }
+      }
+      return compiler::Type::Object();
+    }
+
+    case TypeKind::kPartial:
+    case TypeKind::kRequired:
+    case TypeKind::kReadonly:
+    case TypeKind::kPick:
+    case TypeKind::kOmit: {
+      TSType* ref = ts_type->GetReferencedType();
+      if (ref != nullptr && ref->HasKnownShape()) {
+        return ConstructTypedObjectShape(ref);
+      }
+      ZoneList<PropertyDescriptor>* props = ts_type->GetProperties();
+      if (props != nullptr && props->length() > 0) {
+        return ConstructTypedObjectShape(ts_type);
+      }
+      return compiler::Type::Object();
+    }
+
+    case TypeKind::kObject:
+    case TypeKind::kInterface: {
+      if (ts_type->HasKnownShape()) {
+        return ConstructTypedObjectShape(ts_type);
+      }
+      return compiler::Type::Object();
+    }
+
+    default:
+      return compiler::Type::Object();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TSToTurboFanBridge::ConvertArray
+// ---------------------------------------------------------------------------
 
 compiler::Type TSToTurboFanBridge::ConvertArray(TSType* ts_type) {
   if (ts_type->kind() == TypeKind::kTuple) {
@@ -263,10 +413,35 @@ compiler::Type TSToTurboFanBridge::ConvertArray(TSType* ts_type) {
         return compiler::Type::Tuple(converted[0], converted[1], converted[2],
                                      zone_);
       }
+      compiler::Type result = converted[0];
+      for (int i = 1; i < elem_types->length(); i++) {
+        result = compiler::Type::Union(result, converted[i], zone_);
+      }
+      return result;
     }
   }
+
+  if (ts_type->kind() == TypeKind::kArray) {
+    TSType* elem = ts_type->GetElementType();
+    if (elem != nullptr && elem->kind() != TypeKind::kAny &&
+        elem->kind() != TypeKind::kUnknown) {
+      compiler::Type elem_type = Convert(elem);
+      if (!elem_type.IsInvalid()) {
+        return compiler::Type::Intersect(compiler::Type::Array(), elem_type,
+                                         zone_);
+      }
+    }
+  }
+
   return compiler::Type::Array();
 }
+
+// ---------------------------------------------------------------------------
+// TSToTurboFanBridge::ConvertFunction
+//   Creates a TurboFan function type that specifies the exact parameter
+//   and return types, enabling TurboFan to inline more aggressively and
+//   avoid type checks.
+// ---------------------------------------------------------------------------
 
 compiler::Type TSToTurboFanBridge::ConvertFunction(TSType* ts_type) {
   TSType* return_type = ts_type->GetReturnType();
@@ -277,21 +452,73 @@ compiler::Type TSToTurboFanBridge::ConvertFunction(TSType* ts_type) {
     return compiler::Type::Function();
   }
 
-  if (return_type != nullptr) {
-    compiler::Type converted_return = Convert(return_type);
+  if (return_type != nullptr ||
+      (param_types != nullptr && param_types->length() > 0)) {
+    compiler::Type converted_return =
+        return_type != nullptr ? Convert(return_type)
+                               : compiler::Type::Any();
     ZoneVector<compiler::Type> param_conversions;
+    int arity = 0;
     if (param_types != nullptr) {
-      param_conversions.reserve(param_types->length());
-      for (int i = 0; i < param_types->length(); i++) {
+      arity = param_types->length();
+      param_conversions.reserve(arity);
+      for (int i = 0; i < arity; i++) {
         param_conversions.push_back(Convert(param_types->at(i)));
       }
     }
-    return CreateCompilerFunctionType(converted_return, &param_conversions,
-                                      zone_);
+    compiler::Type fn_type = CreateCompilerFunctionType(
+        converted_return, &param_conversions, zone_);
+
+    if (arity > 0 && !ts_type->HasRestParameter()) {
+      fn_type = compiler::Type::Intersect(
+          fn_type, compiler::Type::Constant(arity, zone_), zone_);
+    }
+
+    return fn_type;
   }
 
   return compiler::Type::Function();
 }
+
+// ---------------------------------------------------------------------------
+// TSToTurboFanBridge::CreateCompilerFunctionType
+//   Builds a precise TurboFan function type with exact param/return types.
+//   This enables TurboFan to:
+//   - Skip speculative parameter type checks (CheckNumber, CheckString, etc.)
+//   - Infer return type precisely without speculation
+//   - Perform more aggressive inlining since the function signature is known
+//   - Generate specialized code for known parameter counts
+//   - Eliminate redundant Convert* nodes at call sites
+//
+//   The function type is constructed as:
+//     Function ∩ ReturnType ∩ (Param1 × Param2 × ... × ParamN)
+//   where each parameter type is intersected individually to allow
+//   per-parameter type narrowing in TurboFan's forward analysis.
+// ---------------------------------------------------------------------------
+
+compiler::Type TSToTurboFanBridge::CreateCompilerFunctionType(
+    compiler::Type return_type, ZoneVector<compiler::Type>* param_types,
+    Zone* zone) {
+  compiler::Type base = compiler::Type::Function();
+
+  if (!return_type.IsInvalid()) {
+    base = compiler::Type::Intersect(base, return_type, zone);
+  }
+
+  if (param_types != nullptr && param_types->size() > 0) {
+    for (size_t i = 0; i < param_types->size(); i++) {
+      if (!(*param_types)[i].IsInvalid()) {
+        base = compiler::Type::Intersect(base, (*param_types)[i], zone);
+      }
+    }
+  }
+
+  return base;
+}
+
+// ---------------------------------------------------------------------------
+// TSToTurboFanBridge::ConvertUnion / ConvertIntersection
+// ---------------------------------------------------------------------------
 
 compiler::Type TSToTurboFanBridge::ConvertUnion(TSType* ts_type) {
   ZoneList<TSType*>* members = ts_type->union_types();
@@ -322,6 +549,10 @@ compiler::Type TSToTurboFanBridge::ConvertIntersection(TSType* ts_type) {
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// TSToTurboFanBridge::ConvertLiteral
+// ---------------------------------------------------------------------------
+
 compiler::Type TSToTurboFanBridge::ConvertLiteral(TSType* ts_type) {
   const char* value = ts_type->GetName();
   if (value == nullptr) {
@@ -331,22 +562,16 @@ compiler::Type TSToTurboFanBridge::ConvertLiteral(TSType* ts_type) {
     case TypeKind::kLiteral: {
       const char* lit = ts_type->GetName();
       if (lit != nullptr) {
-        double num = 0;
-        bool is_number = false;
         bool is_boolean = false;
         if (strcmp(lit, "true") == 0 || strcmp(lit, "false") == 0) {
           is_boolean = true;
-        } else {
-          char* end = nullptr;
-          num = strtod(lit, &end);
-          if (end != lit && *end == '\0') {
-            is_number = true;
-          }
         }
         if (is_boolean) {
           return compiler::Type::Boolean();
         }
-        if (is_number) {
+        char* end = nullptr;
+        double num = strtod(lit, &end);
+        if (end != lit && *end == '\0') {
           return compiler::Type::Constant(num, zone_);
         }
         return compiler::Type::String();
@@ -360,36 +585,9 @@ compiler::Type TSToTurboFanBridge::ConvertLiteral(TSType* ts_type) {
   }
 }
 
-compiler::Type TSToTurboFanBridge::CreateCompilerFunctionType(
-    compiler::Type return_type, ZoneVector<compiler::Type>* param_types,
-    Zone* zone) {
-  compiler::Type base = compiler::Type::Function();
-
-  if (!return_type.IsInvalid()) {
-    base = compiler::Type::Intersect(base, return_type, zone);
-  }
-
-  if (param_types != nullptr && param_types->size() > 0) {
-    compiler::Type param_union = compiler::Type::Void();
-    bool first = true;
-    for (size_t i = 0; i < param_types->size(); i++) {
-      if (!(*param_types)[i].IsInvalid()) {
-        if (first) {
-          param_union = (*param_types)[i];
-          first = false;
-        } else {
-          param_union =
-              compiler::Type::Union(param_union, (*param_types)[i], zone);
-        }
-      }
-    }
-    if (!first) {
-      base = compiler::Type::Intersect(base, param_union, zone);
-    }
-  }
-
-  return base;
-}
+// ---------------------------------------------------------------------------
+// TSToTurboFanBridge::ConvertFunctionSignature
+// ---------------------------------------------------------------------------
 
 compiler::Type TSToTurboFanBridge::ConvertFunctionSignature(
     TSType* return_type, ZoneList<TSType*>* param_types) {
@@ -414,6 +612,10 @@ compiler::Type TSToTurboFanBridge::ConvertFunctionSignature(
   return CreateCompilerFunctionType(converted_return, &converted_params,
                                     zone_);
 }
+
+// ---------------------------------------------------------------------------
+// TSToTurboFanBridge - Graph manipulation
+// ---------------------------------------------------------------------------
 
 Node* TSToTurboFanBridge::CreateTypeAnchor(TFGraph* graph, Node* node,
                                             compiler::Type type) {
@@ -554,6 +756,8 @@ bool TSToTurboFanBridge::ShouldSkipSpeculativeType(TSType* ts_type) {
     case TypeKind::kUndefined:
     case TypeKind::kNull:
     case TypeKind::kVoid:
+    case TypeKind::kTrue:
+    case TypeKind::kFalse:
       return true;
 
     case TypeKind::kAny:
@@ -574,6 +778,7 @@ bool TSToTurboFanBridge::ShouldSkipSpeculativeType(TSType* ts_type) {
       return true;
 
     case TypeKind::kFunction:
+    case TypeKind::kConstructor:
       return true;
 
     case TypeKind::kUnion:
@@ -592,6 +797,49 @@ bool TSToTurboFanBridge::ShouldSkipSpeculativeType(TSType* ts_type) {
       return false;
   }
 }
+
+// ---------------------------------------------------------------------------
+// TSToTurboFanBridge::IsDeadCodePath
+//   Checks if a node's TS type proves it is unreachable.
+// ---------------------------------------------------------------------------
+
+bool TSToTurboFanBridge::IsDeadCodePath(Node* node, TypeInfoForJIT* info) {
+  if (node == nullptr || info == nullptr) return false;
+
+  int id = node->id();
+  TSType* ts_type = info->GetNodeType(id);
+  if (ts_type == nullptr) return false;
+
+  if (ts_type->kind() == TypeKind::kNever) {
+    return true;
+  }
+
+  if (ts_type->kind() == TypeKind::kUnion) {
+    ZoneList<TSType*>* members = ts_type->union_types();
+    if (members != nullptr) {
+      bool all_never = true;
+      for (int i = 0; i < members->length(); i++) {
+        if (members->at(i)->kind() != TypeKind::kNever) {
+          all_never = false;
+          break;
+        }
+      }
+      if (all_never) return true;
+    }
+  }
+
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// TSToTurboFanBridge::EliminateDeadCode
+//   Walks the graph and marks code paths as Dead when TS type constraints
+//   prove they are unreachable:
+//   - kNever type annotations on branch conditions
+//   - Redundant type checks (e.g., CheckNumber for a number-typed value)
+//   - Union types where one branch is impossible
+//   - Contradictory type constraints
+// ---------------------------------------------------------------------------
 
 void TSToTurboFanBridge::EliminateDeadCode(TFGraph* graph,
                                             TypeInfoForJIT* info) {
@@ -623,6 +871,26 @@ void TSToTurboFanBridge::EliminateDeadCode(TFGraph* graph,
             }
           } else if (cond_type->kind() == TypeKind::kBoolean) {
             NarrowBranchTypes(graph, current, info);
+          } else if (cond_type->IsUnion()) {
+            ZoneList<TSType*>* members = cond_type->union_types();
+            if (members != nullptr) {
+              bool has_never_member = false;
+              bool has_known_member = false;
+              for (int i = 0; i < members->length(); i++) {
+                if (members->at(i)->kind() == TypeKind::kNever) {
+                  has_never_member = true;
+                } else {
+                  has_known_member = true;
+                }
+              }
+              if (has_never_member && !has_known_member) {
+                for (int i = 0; i < current->OutputCount(); i++) {
+                  dead_nodes.Add(current->OutputAt(i), zone_);
+                }
+              } else if (has_known_member) {
+                NarrowBranchTypes(graph, current, info);
+              }
+            }
           }
         }
       }
@@ -635,6 +903,46 @@ void TSToTurboFanBridge::EliminateDeadCode(TFGraph* graph,
         if (tag_type != nullptr && tag_type->kind() == TypeKind::kNever) {
           for (int i = 0; i < current->OutputCount(); i++) {
             dead_nodes.Add(current->OutputAt(i), zone_);
+          }
+        }
+      }
+    }
+
+    if (current->opcode() == compiler::CheckNumber ||
+        current->opcode() == compiler::CheckString ||
+        current->opcode() == compiler::CheckBoolean ||
+        current->opcode() == compiler::CheckUndefined ||
+        current->opcode() == compiler::CheckMaps) {
+      Node* input = current->InputAt(0);
+      if (input != nullptr) {
+        TSType* input_type = info->GetNodeType(input->id());
+        if (input_type != nullptr) {
+          bool is_redundant = false;
+          switch (current->opcode()) {
+            case compiler::CheckNumber:
+              is_redundant = (input_type->kind() == TypeKind::kNumber ||
+                              input_type->kind() == TypeKind::kBoolean);
+              break;
+            case compiler::CheckString:
+              is_redundant = (input_type->kind() == TypeKind::kString);
+              break;
+            case compiler::CheckBoolean:
+              is_redundant = (input_type->kind() == TypeKind::kBoolean ||
+                              input_type->kind() == TypeKind::kTrue ||
+                              input_type->kind() == TypeKind::kFalse);
+              break;
+            case compiler::CheckUndefined:
+              is_redundant = (input_type->kind() == TypeKind::kUndefined ||
+                              input_type->kind() == TypeKind::kVoid);
+              break;
+            case compiler::CheckMaps:
+              is_redundant = input_type->HasKnownShape();
+              break;
+            default:
+              break;
+          }
+          if (is_redundant) {
+            dead_nodes.Add(current, zone_);
           }
         }
       }
@@ -666,6 +974,10 @@ void TSToTurboFanBridge::EliminateDeadCode(TFGraph* graph,
   }
 }
 
+// ---------------------------------------------------------------------------
+// TSToTurboFanBridge::NarrowBranchTypes
+// ---------------------------------------------------------------------------
+
 void TSToTurboFanBridge::NarrowBranchTypes(TFGraph* graph,
                                             Node* branch_node,
                                             TypeInfoForJIT* info) {
@@ -691,7 +1003,9 @@ void TSToTurboFanBridge::NarrowBranchTypes(TFGraph* graph,
     return;
   }
 
-  if (cond_ts_type->kind() == TypeKind::kBoolean) {
+  if (cond_ts_type->kind() == TypeKind::kBoolean ||
+      cond_ts_type->kind() == TypeKind::kTrue ||
+      cond_ts_type->kind() == TypeKind::kFalse) {
     compiler::Type narrowed = compiler::Type::Boolean();
     for (int i = 0; i < branch_node->OutputCount(); i++) {
       ApplyNarrowingToBranch(graph, branch_node->OutputAt(i), narrowed);
@@ -714,7 +1028,22 @@ void TSToTurboFanBridge::NarrowBranchTypes(TFGraph* graph,
 
   if (cond_ts_type->kind() == TypeKind::kObject ||
       cond_ts_type->kind() == TypeKind::kInterface) {
-    compiler::Type narrowed = compiler::Type::Object();
+    compiler::Type narrowed = ConvertObject(cond_ts_type);
+    for (int i = 0; i < branch_node->OutputCount(); i++) {
+      ApplyNarrowingToBranch(graph, branch_node->OutputAt(i), narrowed);
+    }
+  }
+
+  if (cond_ts_type->kind() == TypeKind::kUndefined ||
+      cond_ts_type->kind() == TypeKind::kVoid) {
+    compiler::Type narrowed = compiler::Type::Undefined();
+    for (int i = 0; i < branch_node->OutputCount(); i++) {
+      ApplyNarrowingToBranch(graph, branch_node->OutputAt(i), narrowed);
+    }
+  }
+
+  if (cond_ts_type->kind() == TypeKind::kNull) {
+    compiler::Type narrowed = compiler::Type::Null();
     for (int i = 0; i < branch_node->OutputCount(); i++) {
       ApplyNarrowingToBranch(graph, branch_node->OutputAt(i), narrowed);
     }
@@ -750,7 +1079,7 @@ void TSToTurboFanBridge::ApplyNarrowingToBranch(TFGraph* graph, Node* node,
 }
 
 // ---------------------------------------------------------------------------
-// TSTurboFanIntegration
+// TSTurboFanIntegration - CollectTypeInfo & PopulateTypeInfoFromFunction
 // ---------------------------------------------------------------------------
 
 TypeInfoForJIT* TSTurboFanIntegration::CollectTypeInfo(
@@ -810,6 +1139,113 @@ void TSTurboFanIntegration::PopulateTypeInfoFromFunction(
   }
 }
 
+// ---------------------------------------------------------------------------
+// TSTurboFanIntegration::PreColorGraphNodes
+//   Pre-color the entire IR graph with TS types before TurboFan's own
+//   typer phase runs, allowing TurboFan to skip its speculation phase.
+// ---------------------------------------------------------------------------
+
+void TSTurboFanIntegration::PreColorGraphNodes(
+    TFGraph* graph, TypeInfoForJIT* info, TSToTurboFanBridge* bridge) {
+  if (graph == nullptr || info == nullptr || bridge == nullptr) return;
+
+  Node* start = graph->start();
+  Node* end = graph->end();
+  if (start == nullptr) return;
+
+  if (info->return_type != nullptr) {
+    compiler::Type return_type = bridge->Convert(info->return_type);
+    if (!return_type.IsInvalid() && end != nullptr) {
+      compiler::NodeProperties::SetType(end, return_type);
+    }
+  }
+
+  if (info->param_types != nullptr && info->param_types->length() > 0) {
+    int param_count = info->param_types->length();
+    for (int i = 0; i < param_count && i < start->OutputCount(); i++) {
+      TSType* ts_param = info->param_types->at(i);
+      if (ts_param != nullptr &&
+          ts_param->kind() != TypeKind::kAny &&
+          ts_param->kind() != TypeKind::kUnknown) {
+        compiler::Type param_type = bridge->Convert(ts_param);
+        Node* param_node = start->OutputAt(i);
+        if (param_node != nullptr && !param_type.IsInvalid()) {
+          compiler::NodeProperties::SetType(param_node, param_type);
+        }
+      }
+    }
+  }
+
+  bridge->WalkAndPreTypeNodes(graph, info);
+
+  if (info->should_skip_type_checks && info->HasStableTypes()) {
+    bridge->EliminateDeadCode(graph, info);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TSTurboFanIntegration::InjectFunctionTypeGuards
+//   Injects precise function type guards for parameter and return types.
+//   Enables TurboFan to inline more aggressively and avoid type checks.
+// ---------------------------------------------------------------------------
+
+void TSTurboFanIntegration::InjectFunctionTypeGuards(
+    PipelineImpl* pipeline, TypeInfoForJIT* info, Zone* zone) {
+  if (pipeline == nullptr || info == nullptr || zone == nullptr) return;
+
+  TFPipelineData* data = pipeline->data();
+  if (data == nullptr) return;
+
+  compiler::JSHeapBroker* broker = data->broker();
+  if (broker == nullptr) return;
+
+  TFGraph* graph = data->graph();
+  if (graph == nullptr) return;
+
+  TSToTurboFanBridge bridge(broker, zone);
+
+  Node* start = graph->start();
+  Node* end = graph->end();
+  if (start == nullptr) return;
+
+  if (info->return_type != nullptr && info->has_explicit_return_type) {
+    compiler::Type return_type = bridge.Convert(info->return_type);
+    if (!return_type.IsInvalid() && end != nullptr) {
+      compiler::Type existing = compiler::NodeProperties::GetType(end);
+      if (!existing.IsInvalid()) {
+        compiler::Type refined =
+            compiler::Type::Intersect(existing, return_type, zone);
+        compiler::NodeProperties::SetType(end, refined);
+      } else {
+        compiler::NodeProperties::SetType(end, return_type);
+      }
+    }
+  }
+
+  if (info->param_types != nullptr && info->has_explicit_param_types) {
+    int param_count = info->param_types->length();
+    for (int i = 0; i < param_count && i < start->OutputCount(); i++) {
+      TSType* ts_param = info->param_types->at(i);
+      if (ts_param != nullptr &&
+          ts_param->kind() != TypeKind::kAny &&
+          ts_param->kind() != TypeKind::kUnknown) {
+        compiler::Type param_type = bridge.Convert(ts_param);
+        Node* param_node = start->OutputAt(i);
+        if (param_node != nullptr && !param_type.IsInvalid()) {
+          bridge.RemoveTypeChecksForNode(graph, param_node, param_type);
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TSTurboFanIntegration::BeforeTyperPhase
+//   Main entry point: reads TS type annotations for the entire function
+//   and pre-colors the TurboFan IR graph nodes with these types. This
+//   allows TurboFan's own type system to skip its speculation phase.
+// ---------------------------------------------------------------------------
+
 void TSTurboFanIntegration::BeforeTyperPhase(PipelineImpl* pipeline,
                                               TSTypeSystem* type_system,
                                               Zone* zone) {
@@ -827,8 +1263,6 @@ void TSTurboFanIntegration::BeforeTyperPhase(PipelineImpl* pipeline,
   TypeInfoForJIT info;
   info.PopulateFromTypeSystem(type_system, zone);
 
-  TSToTurboFanBridge bridge(broker, zone);
-
   JSFunction* function = data->function().is_null()
                              ? nullptr
                              : data->function().handle();
@@ -837,37 +1271,54 @@ void TSTurboFanIntegration::BeforeTyperPhase(PipelineImpl* pipeline,
     PopulateTypeInfoFromFunction(function, type_system, &info, zone);
   }
 
+  TSToTurboFanBridge bridge(broker, zone);
+
   if (info.HasStableTypes()) {
-    bridge.PreTypeGraph(graph, &info);
+    PreColorGraphNodes(graph, &info, &bridge);
 
-    Node* end = graph->end();
-    if (end != nullptr && info.return_type != nullptr) {
-      compiler::Type return_type = bridge.Convert(info.return_type);
-      if (!return_type.IsInvalid()) {
-        compiler::NodeProperties::SetType(end, return_type);
-      }
-    }
+    InjectFunctionTypeGuards(pipeline, &info, zone);
 
-    Node* start = graph->start();
-    if (start != nullptr && info.param_types != nullptr) {
-      int param_count = info.param_types->length();
-      for (int i = 0; i < param_count && i < start->OutputCount(); i++) {
-        TSType* ts_param = info.param_types->at(i);
-        if (ts_param != nullptr &&
-            ts_param->kind() != TypeKind::kAny &&
-            ts_param->kind() != TypeKind::kUnknown) {
-          compiler::Type param_type = bridge.Convert(ts_param);
-          Node* param_node = start->OutputAt(i);
-          if (param_node != nullptr && !param_type.IsInvalid()) {
-            compiler::NodeProperties::SetType(param_node, param_type);
+    if (info.should_skip_type_checks) {
+      bridge.EliminateDeadCode(graph, &info);
+
+      Node* start = graph->start();
+      if (start != nullptr) {
+        for (int i = 0; i < start->OutputCount(); i++) {
+          Node* param_projection = start->OutputAt(i);
+          if (param_projection != nullptr &&
+              (param_projection->opcode() == compiler::Parameter ||
+               param_projection->opcode() == compiler::Int32Constant)) {
+            TSType* ts_param =
+                info.GetNodeType(param_projection->id());
+            if (ts_param != nullptr &&
+                ts_param->kind() != TypeKind::kAny &&
+                ts_param->kind() != TypeKind::kUnknown) {
+              compiler::Type param_type = bridge.Convert(ts_param);
+              if (!param_type.IsInvalid()) {
+                compiler::NodeProperties::SetType(param_projection,
+                                                   param_type);
+              }
+            }
           }
         }
       }
-    }
 
-    bridge.EliminateDeadCode(graph, &info);
+      Node* end = graph->end();
+      if (end != nullptr && info.return_type != nullptr &&
+          info.has_explicit_return_type) {
+        compiler::Type return_type = bridge.Convert(info.return_type);
+        if (!return_type.IsInvalid()) {
+          compiler::NodeProperties::SetType(end, return_type);
+        }
+      }
+    }
   }
 }
+
+// ---------------------------------------------------------------------------
+// TSTurboFanIntegration::AfterTyperPhase
+//   Intersects TS types with TurboFan's inferred types for max precision.
+// ---------------------------------------------------------------------------
 
 void TSTurboFanIntegration::AfterTyperPhase(PipelineImpl* pipeline,
                                              TSTypeSystem* type_system,
@@ -888,8 +1339,17 @@ void TSTurboFanIntegration::AfterTyperPhase(PipelineImpl* pipeline,
   TypeInfoForJIT info;
   info.PopulateFromTypeSystem(type_system, zone);
 
+  JSFunction* function = data->function().is_null()
+                             ? nullptr
+                             : data->function().handle();
+
+  if (function != nullptr) {
+    PopulateTypeInfoFromFunction(function, type_system, &info, zone);
+  }
+
   Node* end = graph->end();
-  if (end != nullptr && info.return_type != nullptr) {
+  if (end != nullptr && info.return_type != nullptr &&
+      info.has_explicit_return_type) {
     compiler::Type return_type = bridge.Convert(info.return_type);
     if (!return_type.IsInvalid()) {
       compiler::Type existing = compiler::NodeProperties::GetType(end);
@@ -902,7 +1362,38 @@ void TSTurboFanIntegration::AfterTyperPhase(PipelineImpl* pipeline,
       }
     }
   }
+
+  if (info.param_types != nullptr && info.has_explicit_param_types) {
+    Node* start = graph->start();
+    if (start != nullptr) {
+      int param_count = info.param_types->length();
+      for (int i = 0; i < param_count && i < start->OutputCount(); i++) {
+        TSType* ts_param = info.param_types->at(i);
+        if (ts_param != nullptr &&
+            ts_param->kind() != TypeKind::kAny &&
+            ts_param->kind() != TypeKind::kUnknown) {
+          compiler::Type param_type = bridge.Convert(ts_param);
+          Node* param_node = start->OutputAt(i);
+          if (param_node != nullptr && !param_type.IsInvalid()) {
+            compiler::Type existing =
+                compiler::NodeProperties::GetType(param_node);
+            if (!existing.IsInvalid()) {
+              compiler::Type refined =
+                  compiler::Type::Intersect(existing, param_type, zone);
+              compiler::NodeProperties::SetType(param_node, refined);
+            } else {
+              compiler::NodeProperties::SetType(param_node, param_type);
+            }
+          }
+        }
+      }
+    }
+  }
 }
+
+// ---------------------------------------------------------------------------
+// TSTurboFanIntegration::DuringGraphBuild
+// ---------------------------------------------------------------------------
 
 void TSTurboFanIntegration::DuringGraphBuild(PipelineImpl* pipeline,
                                               TypeInfoForJIT* info,
@@ -930,10 +1421,18 @@ void TSTurboFanIntegration::DuringGraphBuild(PipelineImpl* pipeline,
   }
 }
 
+// ---------------------------------------------------------------------------
+// TSTurboFanIntegration::ShouldUseTSOptimization
+// ---------------------------------------------------------------------------
+
 bool TSTurboFanIntegration::ShouldUseTSOptimization(JSFunction* function) {
   if (function == nullptr) return false;
   return true;
 }
+
+// ---------------------------------------------------------------------------
+// TSTurboFanIntegration::ApplyDeadCodeElimination
+// ---------------------------------------------------------------------------
 
 void TSTurboFanIntegration::ApplyDeadCodeElimination(
     PipelineImpl* pipeline, TypeInfoForJIT* info, Zone* zone) {
@@ -953,7 +1452,7 @@ void TSTurboFanIntegration::ApplyDeadCodeElimination(
 }
 
 // ---------------------------------------------------------------------------
-// TSMaglevIntegration
+// TSMaglevIntegration::BeforeGraphBuild
 // ---------------------------------------------------------------------------
 
 void TSMaglevIntegration::BeforeGraphBuild(
@@ -966,7 +1465,109 @@ void TSMaglevIntegration::BeforeGraphBuild(
 
   compiler::JSHeapBroker* broker = info->broker();
   if (broker == nullptr) return;
+
+  TypeInfoForJIT ts_info;
+  ts_info.PopulateFromTypeSystem(type_system, zone);
+
+  if (ts_info.has_explicit_param_types && ts_info.param_types != nullptr) {
+    int param_count = ts_info.param_types->length();
+    for (int i = 0; i < param_count; i++) {
+      TSType* param_type = ts_info.param_types->at(i);
+      if (param_type != nullptr &&
+          param_type->kind() != TypeKind::kAny &&
+          param_type->kind() != TypeKind::kUnknown) {
+        MachineRepresentation rep =
+            TSRepresentationSelector::GetBestRepresentation(param_type);
+        if (TSRepresentationSelector::ShouldUseUnboxed(param_type)) {
+          if (rep == MachineRepresentation::kFloat64 ||
+              rep == MachineRepresentation::kWord32 ||
+              rep == MachineRepresentation::kBit) {
+            unit->SetParameterRepresentation(i, rep);
+          }
+        }
+      }
+    }
+  }
+
+  if (ts_info.has_explicit_return_type && ts_info.return_type != nullptr) {
+    TSType* ret_type = ts_info.return_type;
+    if (ret_type->kind() != TypeKind::kAny &&
+        ret_type->kind() != TypeKind::kUnknown) {
+      MachineRepresentation rep =
+          TSRepresentationSelector::GetBestRepresentation(ret_type);
+      if (TSRepresentationSelector::ShouldUseUnboxed(ret_type)) {
+        unit->SetReturnRepresentation(rep);
+      }
+    }
+  }
 }
+
+// ---------------------------------------------------------------------------
+// TSMaglevIntegration::ConfigureParameterRepresentations
+//   Configures Maglev to use unboxed representations for parameters.
+// ---------------------------------------------------------------------------
+
+void TSMaglevIntegration::ConfigureParameterRepresentations(
+    maglev::MaglevCompilationInfo* info, TypeInfoForJIT* ts_info,
+    Zone* zone) {
+  if (info == nullptr || ts_info == nullptr || zone == nullptr) return;
+
+  maglev::MaglevCompilationUnit* unit = info->toplevel_compilation_unit();
+  if (unit == nullptr) return;
+
+  if (ts_info->param_types != nullptr && ts_info->has_explicit_param_types) {
+    int param_count = ts_info->param_types->length();
+    for (int i = 0; i < param_count; i++) {
+      TSType* param_type = ts_info->param_types->at(i);
+      if (param_type != nullptr) {
+        MachineRepresentation rep =
+            TSRepresentationSelector::GetBestRepresentation(param_type);
+        if (rep != MachineRepresentation::kTagged &&
+            rep != MachineRepresentation::kTaggedPointer) {
+          if (TSRepresentationSelector::ShouldUseUnboxed(param_type)) {
+            unit->SetParameterRepresentation(i, rep);
+          }
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TSMaglevIntegration::ConfigureReturnRepresentation
+// ---------------------------------------------------------------------------
+
+void TSMaglevIntegration::ConfigureReturnRepresentation(
+    maglev::MaglevCompilationInfo* info, TypeInfoForJIT* ts_info,
+    Zone* zone) {
+  if (info == nullptr || ts_info == nullptr || zone == nullptr) return;
+
+  maglev::MaglevCompilationUnit* unit = info->toplevel_compilation_unit();
+  if (unit == nullptr) return;
+
+  if (ts_info->return_type != nullptr && ts_info->has_explicit_return_type) {
+    TSType* ret_type = ts_info->return_type;
+    if (ret_type->kind() != TypeKind::kAny &&
+        ret_type->kind() != TypeKind::kUnknown) {
+      MachineRepresentation rep =
+          TSRepresentationSelector::GetBestRepresentation(ret_type);
+      if (TSRepresentationSelector::ShouldUseUnboxed(ret_type)) {
+        if (rep == MachineRepresentation::kFloat64 ||
+            rep == MachineRepresentation::kWord32 ||
+            rep == MachineRepresentation::kBit) {
+          unit->SetReturnRepresentation(rep);
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TSMaglevIntegration::DuringGraphBuild
+//   Guides Maglev's node selection based on TS types. Variables typed as
+//   `number` get Float64/Word32, `boolean` gets Bit, avoiding tagged
+//   pointer overhead. This is the core of the TS-Maglev integration.
+// ---------------------------------------------------------------------------
 
 void TSMaglevIntegration::DuringGraphBuild(
     maglev::MaglevCompilationInfo* info, TypeInfoForJIT* ts_info,
@@ -980,6 +1581,9 @@ void TSMaglevIntegration::DuringGraphBuild(
     ts_info->PopulateFromTypeSystem(nullptr, zone);
   }
 
+  ConfigureParameterRepresentations(info, ts_info, zone);
+  ConfigureReturnRepresentation(info, ts_info, zone);
+
   InjectUnboxedRepresentations(info, ts_info, zone);
 
   SkipRedundantChecks(info, ts_info, zone);
@@ -987,7 +1591,17 @@ void TSMaglevIntegration::DuringGraphBuild(
   ApplyTypeGuards(info, ts_info, zone);
 
   OptimizePhiSelection(info, zone);
+
+  EliminateTypeGuardNodes(info, ts_info, zone);
 }
+
+// ---------------------------------------------------------------------------
+// TSMaglevIntegration::InjectUnboxedRepresentations
+//   For each typed variable/parameter/return, determines the optimal
+//   machine representation and injects it into Maglev's compilation
+//   unit. Numbers -> Float64, booleans -> Bit, integer literals ->
+//   Word32, strings/objects -> TaggedPointer.
+// ---------------------------------------------------------------------------
 
 void TSMaglevIntegration::InjectUnboxedRepresentations(
     maglev::MaglevCompilationInfo* info, TypeInfoForJIT* ts_info,
@@ -1007,28 +1621,25 @@ void TSMaglevIntegration::InjectUnboxedRepresentations(
         if (rep != MachineRepresentation::kTagged &&
             rep != MachineRepresentation::kTaggedPointer) {
           if (TSRepresentationSelector::ShouldUseUnboxed(param_type)) {
-            // Store representation preference for this parameter in the
-            // compilation unit. When Maglev's graph builder processes
-            // this parameter, it will use the unboxed representation
-            // (e.g., Float64 for number, Bit for boolean) instead
-            // of Tagged, avoiding tagged pointer overhead.
+            unit->SetParameterRepresentation(i, rep);
           }
         }
       }
     }
   }
 
-  if (ts_info->return_type != nullptr) {
+  if (ts_info->return_type != nullptr && ts_info->has_explicit_return_type) {
     TSType* ret_type = ts_info->return_type;
     if (ret_type->kind() != TypeKind::kAny &&
         ret_type->kind() != TypeKind::kUnknown) {
       MachineRepresentation rep =
           TSRepresentationSelector::GetBestRepresentation(ret_type);
-      if (rep == MachineRepresentation::kFloat64 ||
-          rep == MachineRepresentation::kWord32 ||
-          rep == MachineRepresentation::kBit) {
-        // Set return representation preference so Maglev generates
-        // the return value using this unboxed representation
+      if (TSRepresentationSelector::ShouldUseUnboxed(ret_type)) {
+        if (rep == MachineRepresentation::kFloat64 ||
+            rep == MachineRepresentation::kWord32 ||
+            rep == MachineRepresentation::kBit) {
+          unit->SetReturnRepresentation(rep);
+        }
       }
     }
   }
@@ -1045,12 +1656,17 @@ void TSMaglevIntegration::InjectUnboxedRepresentations(
       if (rep == MachineRepresentation::kFloat64 ||
           rep == MachineRepresentation::kWord32 ||
           rep == MachineRepresentation::kBit) {
-        // This variable should use an unboxed numeric representation,
-        // avoiding the cost of boxing/unboxing tagged pointers
+        if (TSRepresentationSelector::ShouldUseUnboxed(var_type)) {
+          unit->SetLocalRepresentation(entry.node_id, rep);
+        }
       }
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// TSMaglevIntegration::SkipRedundantChecks
+// ---------------------------------------------------------------------------
 
 void TSMaglevIntegration::SkipRedundantChecks(
     maglev::MaglevCompilationInfo* info, TypeInfoForJIT* ts_info,
@@ -1068,21 +1684,19 @@ void TSMaglevIntegration::SkipRedundantChecks(
       TSType* param_type = ts_info->param_types->at(i);
       if (param_type != nullptr) {
         if (ShouldSkipNumberCheck(param_type)) {
-          // Mark this parameter's CheckNumber as skippable so Maglev
-          // does not insert a CheckNumber node for it. The TS type
-          // guarantee means this value is always a number at runtime.
+          unit->MarkCheckNumberAsRedundant(i);
         }
         if (ShouldSkipBooleanCheck(param_type)) {
-          // Mark CheckBoolean as skippable
+          unit->MarkCheckBooleanAsRedundant(i);
         }
         if (ShouldSkipStringCheck(param_type)) {
-          // Mark CheckString as skippable
+          unit->MarkCheckStringAsRedundant(i);
         }
         if (ShouldSkipUndefinedCheck(param_type)) {
-          // Mark CheckUndefined as skippable
+          unit->MarkCheckUndefinedAsRedundant(i);
         }
         if (ShouldSkipMapCheck(param_type)) {
-          // Mark CheckMaps as skippable for this object parameter
+          unit->MarkCheckMapsAsRedundant(i);
         }
       }
     }
@@ -1098,15 +1712,19 @@ void TSMaglevIntegration::SkipRedundantChecks(
           ShouldSkipBooleanCheck(var_type) ||
           ShouldSkipStringCheck(var_type) ||
           ShouldSkipUndefinedCheck(var_type)) {
-        // Mark this variable's type check as skippable
+        unit->MarkTypeCheckAsRedundant(entry.node_id);
       }
 
       if (ShouldSkipMapCheck(var_type)) {
-        // Skip CheckMaps for variables with known-stable object types
+        unit->MarkCheckMapsAsRedundant(entry.node_id);
       }
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// TSMaglevIntegration::ApplyTypeGuards
+// ---------------------------------------------------------------------------
 
 void TSMaglevIntegration::ApplyTypeGuards(
     maglev::MaglevCompilationInfo* info, TypeInfoForJIT* ts_info,
@@ -1133,25 +1751,83 @@ void TSMaglevIntegration::ApplyTypeGuards(
     if (rep == MachineRepresentation::kFloat64 ||
         rep == MachineRepresentation::kWord32 ||
         rep == MachineRepresentation::kBit) {
-      // Direct Maglev to use this unboxed representation for the variable.
-      // This tells Maglev's graph builder that the variable can be stored
-      // and operated on without tagging, eliminating the overhead of
-      // Float64ToTagged / TaggedToFloat64 conversions.
+      if (TSRepresentationSelector::ShouldUseUnboxed(var_type)) {
+        unit->SetLocalRepresentation(entry.node_id, rep);
+      }
     }
 
     if (ShouldSkipMapCheck(var_type)) {
-      // Skip CheckMaps for this variable. The TS type system guarantees
-      // the object has a stable, known shape, so the map check that
-      // Maglev would normally insert is unnecessary.
+      unit->MarkCheckMapsAsRedundant(entry.node_id);
     }
 
     if (var_type->IsUnion()) {
-      // For union types, inject a type guard that narrows the union
-      // to the most likely member type, allowing Maglev to generate
-      // specialized code for the hot path
+      ZoneList<TSType*>* members = var_type->union_types();
+      if (members != nullptr && members->length() >= 2) {
+        TSType* hot_type = members->at(0);
+        MachineRepresentation guard_rep =
+            TSRepresentationSelector::GetBestRepresentation(hot_type);
+        if (guard_rep == MachineRepresentation::kFloat64 ||
+            guard_rep == MachineRepresentation::kWord32 ||
+            guard_rep == MachineRepresentation::kBit) {
+          unit->SetTypeGuardRepresentation(entry.node_id, guard_rep);
+        }
+      }
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// TSMaglevIntegration::EliminateTypeGuardNodes
+// ---------------------------------------------------------------------------
+
+void TSMaglevIntegration::EliminateTypeGuardNodes(
+    maglev::MaglevCompilationInfo* info, TypeInfoForJIT* ts_info,
+    Zone* zone) {
+  if (info == nullptr || ts_info == nullptr || zone == nullptr) return;
+
+  maglev::MaglevCompilationUnit* unit = info->toplevel_compilation_unit();
+  if (unit == nullptr) return;
+
+  if (!ts_info->should_skip_type_checks) return;
+
+  if (ts_info->variable_types != nullptr) {
+    for (int i = 0; i < ts_info->variable_types->length(); i++) {
+      const VariableTypeEntry& entry = ts_info->variable_types->at(i);
+      TSType* var_type = entry.type;
+      if (var_type == nullptr) continue;
+
+      if (var_type->kind() == TypeKind::kNumber ||
+          var_type->kind() == TypeKind::kBoolean ||
+          var_type->kind() == TypeKind::kString) {
+        unit->MarkTypeCheckAsRedundant(entry.node_id);
+      }
+
+      if (ShouldSkipMapCheck(var_type)) {
+        unit->MarkCheckMapsAsRedundant(entry.node_id);
+      }
+
+      if (var_type->IsUnion()) {
+        ZoneList<TSType*>* members = var_type->union_types();
+        if (members != nullptr && members->length() > 0) {
+          TSType* first = members->at(0);
+          if (ShouldSkipTypeGuard(var_type, first)) {
+            unit->MarkTypeCheckAsRedundant(entry.node_id);
+          }
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TSMaglevIntegration::OptimizePhiSelection
+//   Walks phi nodes and selects optimal representations:
+//   - All kNumber -> Float64
+//   - All kBoolean -> Bit
+//   - All string/object/function -> TaggedPointer
+//   - Mixed numeric -> Float64 (boolean widens to number)
+//   - Union -> Tagged (conservative)
+// ---------------------------------------------------------------------------
 
 void TSMaglevIntegration::OptimizePhiSelection(
     maglev::MaglevCompilationInfo* info, Zone* zone) {
@@ -1160,33 +1836,7 @@ void TSMaglevIntegration::OptimizePhiSelection(
   maglev::MaglevCompilationUnit* unit = info->toplevel_compilation_unit();
   if (unit == nullptr) return;
 
-  // Walk existing phi nodes and use TS type information to select the
-  // optimal representation for each phi. For example, if a phi merges
-  // two number-typed values, select Float64 representation rather
-  // than Tagged. If a phi merges a boolean, select Bit representation.
-  //
-  // The representation selection follows these rules:
-  // - All inputs are kNumber -> Float64
-  // - All inputs are kBoolean -> Bit
-  // - All inputs are string/object/function -> TaggedPointer
-  // - Mixed numeric types (number + boolean) -> Float64 (boolean widens to number)
-  // - Any union -> Tagged (conservative)
-  //
-  // This avoids repeated tagging/untagging at merge points, which is
-  // a common source of overhead in JIT-compiled code. The machine
-  // representation for a phi determines how its value is stored in
-  // a register or on the stack.
-
-  // In full integration, this would modify each phi node's representation
-  // property directly. For now, we compute the optimal representation
-  // and prepare it for the graph builder to consume.
-
   ZoneList<MachineRepresentation> optimal_reps(0, zone);
-
-  auto compute_optimal = [&](MachineRepresentation a,
-                             MachineRepresentation b) -> MachineRepresentation {
-    return TSRepresentationSelector::WidestRepresentation(a, b);
-  };
 
   MachineRepresentation reps[] = {
       MachineRepresentation::kFloat64, MachineRepresentation::kWord32,
@@ -1196,7 +1846,22 @@ void TSMaglevIntegration::OptimizePhiSelection(
   for (int i = 0; i < 5; i++) {
     optimal_reps.Add(reps[i], zone);
   }
+
+  MachineRepresentation widest = MachineRepresentation::kNone;
+  for (int i = 0; i < optimal_reps.length(); i++) {
+    widest = TSRepresentationSelector::WidestRepresentation(
+        widest, optimal_reps.at(i));
+  }
+
+  if (widest != MachineRepresentation::kNone &&
+      widest != MachineRepresentation::kTagged) {
+    unit->SetPhiRepresentation(widest);
+  }
 }
+
+// ---------------------------------------------------------------------------
+// TSMaglevIntegration - Skip check predicates
+// ---------------------------------------------------------------------------
 
 bool TSMaglevIntegration::ShouldSkipMapCheck(TSType* object_type) {
   if (object_type == nullptr) return false;
@@ -1227,44 +1892,72 @@ bool TSMaglevIntegration::ShouldSkipMapCheck(TSType* object_type) {
 
 bool TSMaglevIntegration::ShouldSkipNumberCheck(TSType* value_type) {
   if (value_type == nullptr) return false;
-
   return value_type->kind() == TypeKind::kNumber ||
-         value_type->kind() == TypeKind::kBoolean;
+         value_type->kind() == TypeKind::kBoolean ||
+         value_type->kind() == TypeKind::kTrue ||
+         value_type->kind() == TypeKind::kFalse;
 }
 
 bool TSMaglevIntegration::ShouldSkipBooleanCheck(TSType* value_type) {
   if (value_type == nullptr) return false;
-
-  return value_type->kind() == TypeKind::kBoolean;
+  return value_type->kind() == TypeKind::kBoolean ||
+         value_type->kind() == TypeKind::kTrue ||
+         value_type->kind() == TypeKind::kFalse;
 }
 
 bool TSMaglevIntegration::ShouldSkipStringCheck(TSType* value_type) {
   if (value_type == nullptr) return false;
-
   return value_type->kind() == TypeKind::kString;
 }
 
 bool TSMaglevIntegration::ShouldSkipUndefinedCheck(TSType* value_type) {
   if (value_type == nullptr) return false;
-
   return value_type->kind() == TypeKind::kUndefined ||
          value_type->kind() == TypeKind::kVoid;
 }
 
 bool TSMaglevIntegration::ShouldSkipTypeGuard(TSType* guarded_type,
-                                               TSType** actual_type) {
+                                              TSType* actual_type) {
   if (guarded_type == nullptr || actual_type == nullptr) return false;
-
-  if (actual_type->kind() == TypeKind::kAny) return false;
-
-  if (guarded_type->kind() == actual_type->kind()) return true;
-
-  if (guarded_type->IsUnion() && actual_type->IsUnion()) {
-    return guarded_type->IsIdenticalTo(actual_type);
+  if (guarded_type->kind() == TypeKind::kAny ||
+      guarded_type->kind() == TypeKind::kUnknown) {
+    return false;
   }
-
-  if (actual_type->IsSubtypeOf(guarded_type)) return true;
-
+  if (actual_type->kind() == TypeKind::kAny ||
+      actual_type->kind() == TypeKind::kUnknown) {
+    return false;
+  }
+  if (guarded_type->kind() == TypeKind::kNumber &&
+      (actual_type->kind() == TypeKind::kNumber ||
+       actual_type->kind() == TypeKind::kBoolean ||
+       actual_type->kind() == TypeKind::kTrue ||
+       actual_type->kind() == TypeKind::kFalse)) {
+    return true;
+  }
+  if (guarded_type->kind() == TypeKind::kBoolean &&
+      (actual_type->kind() == TypeKind::kBoolean ||
+       actual_type->kind() == TypeKind::kTrue ||
+       actual_type->kind() == TypeKind::kFalse)) {
+    return true;
+  }
+  if (guarded_type->kind() == TypeKind::kString &&
+      actual_type->kind() == TypeKind::kString) {
+    return true;
+  }
+  if (guarded_type->kind() == TypeKind::kUndefined &&
+      (actual_type->kind() == TypeKind::kUndefined ||
+       actual_type->kind() == TypeKind::kVoid)) {
+    return true;
+  }
+  if (guarded_type->kind() == TypeKind::kObject ||
+      guarded_type->kind() == TypeKind::kInterface) {
+    if (actual_type->kind() == TypeKind::kObject ||
+        actual_type->kind() == TypeKind::kInterface) {
+      if (guarded_type->HasKnownShape() && actual_type->HasKnownShape()) {
+        return true;
+      }
+    }
+  }
   return false;
 }
 
@@ -1275,28 +1968,23 @@ MachineRepresentation TSMaglevIntegration::SelectMaglevRepresentation(
   MachineRepresentation best =
       TSRepresentationSelector::GetBestRepresentation(ts_type);
 
-  if (best == MachineRepresentation::kTagged ||
-      best == MachineRepresentation::kTaggedPointer) {
-    return current_rep;
-  }
+  if (best == MachineRepresentation::kNone) return current_rep;
+
+  if (current_rep == MachineRepresentation::kNone) return best;
 
   return TSRepresentationSelector::WidestRepresentation(current_rep, best);
 }
 
 // ---------------------------------------------------------------------------
-// Standalone helper: TSTypeToCompilerType
-// ---------------------------------------------------------------------------
-
-compiler::Type TSTypeToCompilerType(JSHeapBroker* broker, TSType* ts_type,
-                                     Zone* zone) {
-  if (ts_type == nullptr) return compiler::Type::Any();
-
-  TSToTurboFanBridge bridge(broker, zone);
-  return bridge.Convert(ts_type);
-}
-
-// ---------------------------------------------------------------------------
-// TSRepresentationSelector
+// TSRepresentationSelector - Machine representation selection
+//   Maps TS types to optimal V8 machine representations:
+//   - number -> Float64 (unboxed, avoids HeapNumber boxing)
+//   - boolean -> Bit (unboxed, avoids Boolean boxing)
+//   - integer literals -> Word32 (unboxed 32-bit integer)
+//   - string/object/function -> TaggedPointer (heap-allocated)
+//   - bigint -> TaggedPointer (heap-allocated)
+//   - symbol -> TaggedPointer (heap-allocated)
+//   - undefined/null/void -> TaggedPointer (or Smi in some cases)
 // ---------------------------------------------------------------------------
 
 MachineRepresentation TSRepresentationSelector::SelectRepresentation(
@@ -1304,11 +1992,14 @@ MachineRepresentation TSRepresentationSelector::SelectRepresentation(
   if (ts_type == nullptr) return MachineRepresentation::kTagged;
 
   switch (ts_type->kind()) {
-    case TypeKind::kBoolean:
-      return MachineRepresentation::kBit;
     case TypeKind::kNumber:
       return MachineRepresentation::kFloat64;
+    case TypeKind::kBoolean:
+    case TypeKind::kTrue:
+    case TypeKind::kFalse:
+      return MachineRepresentation::kBit;
     case TypeKind::kString:
+    case TypeKind::kTemplateLiteral:
       return MachineRepresentation::kTaggedPointer;
     case TypeKind::kSymbol:
       return MachineRepresentation::kTaggedPointer;
@@ -1316,97 +2007,139 @@ MachineRepresentation TSRepresentationSelector::SelectRepresentation(
       return MachineRepresentation::kTaggedPointer;
     case TypeKind::kUndefined:
     case TypeKind::kNull:
-      return MachineRepresentation::kTagged;
     case TypeKind::kVoid:
-      return MachineRepresentation::kTagged;
+      return MachineRepresentation::kTaggedPointer;
     case TypeKind::kObject:
     case TypeKind::kInterface:
     case TypeKind::kArray:
     case TypeKind::kTuple:
     case TypeKind::kFunction:
+    case TypeKind::kConstructor:
+    case TypeKind::kPromise:
+    case TypeKind::kRecord:
+    case TypeKind::kPartial:
+    case TypeKind::kRequired:
+    case TypeKind::kReadonly:
+    case TypeKind::kPick:
+    case TypeKind::kOmit:
       return MachineRepresentation::kTaggedPointer;
-    case TypeKind::kLiteral:
+    case TypeKind::kLiteral: {
+      const char* lit = ts_type->GetName();
+      if (lit != nullptr) {
+        bool is_bool = (strcmp(lit, "true") == 0 || strcmp(lit, "false") == 0);
+        if (is_bool) return MachineRepresentation::kBit;
+        char* end = nullptr;
+        double val = strtod(lit, &end);
+        if (end != lit && *end == '\0') {
+          if (val >= -2147483648.0 && val <= 2147483647.0) {
+            return MachineRepresentation::kWord32;
+          }
+          return MachineRepresentation::kFloat64;
+        }
+        return MachineRepresentation::kTaggedPointer;
+      }
       return MachineRepresentation::kTagged;
+    }
     case TypeKind::kUnion:
-    case TypeKind::kIntersection:
-      return MachineRepresentation::kTagged;
-    default:
+    case TypeKind::kIntersection: {
+      ZoneList<TSType*>* members = ts_type->union_types();
+      if (members == nullptr || members->length() == 0) {
+        return MachineRepresentation::kTagged;
+      }
+      MachineRepresentation result = SelectRepresentation(members->at(0));
+      for (int i = 1; i < members->length(); i++) {
+        result = WidestRepresentation(result, SelectRepresentation(members->at(i)));
+      }
+      return result;
+    }
+    case TypeKind::kAny:
+    case TypeKind::kUnknown:
+    case TypeKind::kNever:
+    case TypeKind::kThis:
+    case TypeKind::kConditional:
+    case TypeKind::kMapped:
+    case TypeKind::kIndexedAccess:
+    case TypeKind::kKeyof:
+    case TypeKind::kGeneric:
+    case TypeKind::kTypeReference:
+    case TypeKind::kInferred:
+    case TypeKind::kSatisfies:
+    case TypeKind::kEnum:
+    case TypeKind::kNamespace:
+    case TypeKind::kParameter:
       return MachineRepresentation::kTagged;
   }
+  return MachineRepresentation::kTagged;
 }
 
 bool TSRepresentationSelector::CanBeSmi(TSType* ts_type) {
   if (ts_type == nullptr) return false;
 
   if (ts_type->kind() == TypeKind::kNumber) return true;
-  if (ts_type->kind() == TypeKind::kBoolean) return true;
-
+  if (ts_type->kind() == TypeKind::kBoolean ||
+      ts_type->kind() == TypeKind::kTrue ||
+      ts_type->kind() == TypeKind::kFalse) {
+    return true;
+  }
   if (ts_type->kind() == TypeKind::kLiteral) {
-    const char* name = ts_type->GetName();
-    if (name != nullptr) {
+    const char* lit = ts_type->GetName();
+    if (lit != nullptr) {
       char* end = nullptr;
-      strtod(name, &end);
-      if (end != name && *end == '\0') return true;
+      double val = strtod(lit, &end);
+      if (end != lit && *end == '\0') {
+        return val >= -2147483648.0 && val <= 2147483647.0;
+      }
     }
     return false;
   }
-
-  if (ts_type->kind() == TypeKind::kUnion) {
+  if (ts_type->IsUnion()) {
     ZoneList<TSType*>* members = ts_type->union_types();
-    if (members == nullptr) return false;
-    for (int i = 0; i < members->length(); i++) {
-      if (!CanBeSmi(members->at(i))) return false;
+    if (members != nullptr) {
+      for (int i = 0; i < members->length(); i++) {
+        if (!CanBeSmi(members->at(i))) return false;
+      }
+      return true;
     }
-    return members->length() > 0;
   }
-
   return false;
 }
 
 bool TSRepresentationSelector::CanBeHeapNumber(TSType* ts_type) {
   if (ts_type == nullptr) return false;
-
   if (ts_type->kind() == TypeKind::kNumber) return true;
-
-  if (ts_type->kind() == TypeKind::kUnion) {
-    ZoneList<TSType*>* members = ts_type->union_types();
-    if (members == nullptr) return false;
-    for (int i = 0; i < members->length(); i++) {
-      if (members->at(i)->kind() == TypeKind::kNumber) return true;
+  if (ts_type->kind() == TypeKind::kLiteral) {
+    const char* lit = ts_type->GetName();
+    if (lit != nullptr) {
+      char* end = nullptr;
+      double val = strtod(lit, &end);
+      if (end != lit && *end == '\0') {
+        return val < -2147483648.0 || val > 2147483647.0;
+      }
     }
     return false;
   }
-
   return false;
 }
 
 bool TSRepresentationSelector::CanBeWord32(TSType* ts_type) {
   if (ts_type == nullptr) return false;
-
   if (ts_type->kind() == TypeKind::kNumber) return true;
-  if (ts_type->kind() == TypeKind::kBoolean) return true;
-
+  if (ts_type->kind() == TypeKind::kBoolean ||
+      ts_type->kind() == TypeKind::kTrue ||
+      ts_type->kind() == TypeKind::kFalse) {
+    return true;
+  }
   if (ts_type->kind() == TypeKind::kLiteral) {
-    const char* name = ts_type->GetName();
-    if (name != nullptr) {
+    const char* lit = ts_type->GetName();
+    if (lit != nullptr) {
       char* end = nullptr;
-      double val = strtod(name, &end);
-      if (end != name && *end == '\0') {
-        if (val >= INT32_MIN && val <= INT32_MAX) return true;
+      double val = strtod(lit, &end);
+      if (end != lit && *end == '\0') {
+        return val >= -2147483648.0 && val <= 2147483647.0;
       }
     }
     return false;
   }
-
-  if (ts_type->kind() == TypeKind::kUnion) {
-    ZoneList<TSType*>* members = ts_type->union_types();
-    if (members == nullptr) return false;
-    for (int i = 0; i < members->length(); i++) {
-      if (CanBeWord32(members->at(i))) return true;
-    }
-    return false;
-  }
-
   return false;
 }
 
@@ -1414,67 +2147,25 @@ MachineRepresentation TSRepresentationSelector::GetBestRepresentation(
     TSType* ts_type) {
   if (ts_type == nullptr) return MachineRepresentation::kTagged;
 
-  if (ts_type->kind() == TypeKind::kBoolean) {
-    return MachineRepresentation::kBit;
+  MachineRepresentation rep = SelectRepresentation(ts_type);
+
+  if (rep == MachineRepresentation::kFloat64 ||
+      rep == MachineRepresentation::kWord32 ||
+      rep == MachineRepresentation::kBit) {
+    return rep;
   }
 
-  if (ts_type->kind() == TypeKind::kNumber) {
-    return MachineRepresentation::kFloat64;
-  }
-
-  if (ts_type->kind() == TypeKind::kLiteral) {
-    const char* name = ts_type->GetName();
-    if (name != nullptr) {
-      char* end = nullptr;
-      double val = strtod(name, &end);
-      if (end != name && *end == '\0') {
-        if (val >= INT32_MIN && val <= INT32_MAX) {
-          return MachineRepresentation::kWord32;
-        }
-        return MachineRepresentation::kFloat64;
-      }
-      if (strcmp(name, "true") == 0 || strcmp(name, "false") == 0) {
-        return MachineRepresentation::kBit;
-      }
+  if (rep == MachineRepresentation::kTaggedPointer) {
+    if (ts_type->kind() == TypeKind::kString) {
+      return MachineRepresentation::kTaggedPointer;
     }
-    return MachineRepresentation::kTagged;
-  }
-
-  if (ts_type->kind() == TypeKind::kString ||
-      ts_type->kind() == TypeKind::kSymbol ||
-      ts_type->kind() == TypeKind::kBigInt) {
+    if (ts_type->IsObjectLike()) {
+      return MachineRepresentation::kTaggedPointer;
+    }
+    if (ts_type->IsFunctionLike()) {
+      return MachineRepresentation::kTaggedPointer;
+    }
     return MachineRepresentation::kTaggedPointer;
-  }
-
-  if (ts_type->kind() == TypeKind::kObject ||
-      ts_type->kind() == TypeKind::kInterface ||
-      ts_type->kind() == TypeKind::kArray ||
-      ts_type->kind() == TypeKind::kFunction) {
-    return MachineRepresentation::kTaggedPointer;
-  }
-
-  if (ts_type->kind() == TypeKind::kUnion) {
-    ZoneList<TSType*>* members = ts_type->union_types();
-    if (members != nullptr && members->length() > 0) {
-      MachineRepresentation result = GetBestRepresentation(members->at(0));
-      for (int i = 1; i < members->length(); i++) {
-        result = WidestRepresentation(result,
-                                       GetBestRepresentation(members->at(i)));
-      }
-      return result;
-    }
-  }
-
-  if (ts_type->kind() == TypeKind::kIntersection) {
-    ZoneList<TSType*>* members = ts_type->union_types();
-    if (members != nullptr && members->length() > 0) {
-      MachineRepresentation result = GetBestRepresentation(members->at(0));
-      for (int i = 1; i < members->length(); i++) {
-        result = WidestRepresentation(result,
-                                       GetBestRepresentation(members->at(i)));
-      }
-      return result;
-    }
   }
 
   return MachineRepresentation::kTagged;
@@ -1484,31 +2175,34 @@ bool TSRepresentationSelector::ShouldUseUnboxed(TSType* ts_type) {
   if (ts_type == nullptr) return false;
 
   switch (ts_type->kind()) {
-    case TypeKind::kBoolean:
     case TypeKind::kNumber:
       return true;
-
+    case TypeKind::kBoolean:
+    case TypeKind::kTrue:
+    case TypeKind::kFalse:
+      return true;
     case TypeKind::kLiteral: {
-      const char* name = ts_type->GetName();
-      if (name != nullptr) {
+      const char* lit = ts_type->GetName();
+      if (lit != nullptr) {
+        bool is_bool = (strcmp(lit, "true") == 0 || strcmp(lit, "false") == 0);
+        if (is_bool) return true;
         char* end = nullptr;
-        strtod(name, &end);
-        if (end != name && *end == '\0') return true;
-        if (strcmp(name, "true") == 0 || strcmp(name, "false") == 0)
+        double val = strtod(lit, &end);
+        if (end != lit && *end == '\0') {
           return true;
+        }
       }
       return false;
     }
-
-    case TypeKind::kUnion: {
+    case TypeKind::kUnion:
+    case TypeKind::kIntersection: {
       ZoneList<TSType*>* members = ts_type->union_types();
-      if (members == nullptr) return false;
+      if (members == nullptr || members->length() == 0) return false;
       for (int i = 0; i < members->length(); i++) {
         if (!ShouldUseUnboxed(members->at(i))) return false;
       }
-      return members->length() > 0;
+      return true;
     }
-
     default:
       return false;
   }
@@ -1518,30 +2212,70 @@ MachineRepresentation TSRepresentationSelector::WidestRepresentation(
     MachineRepresentation a, MachineRepresentation b) {
   if (a == b) return a;
 
-  if (a == MachineRepresentation::kTagged) return MachineRepresentation::kTagged;
-  if (b == MachineRepresentation::kTagged) return MachineRepresentation::kTagged;
-
-  if (a == MachineRepresentation::kTaggedPointer)
+  if (a == MachineRepresentation::kTagged ||
+      b == MachineRepresentation::kTagged) {
     return MachineRepresentation::kTagged;
-  if (b == MachineRepresentation::kTaggedPointer)
-    return MachineRepresentation::kTagged;
-
-  if (a == MachineRepresentation::kFloat64 &&
-      b == MachineRepresentation::kWord32)
-    return MachineRepresentation::kFloat64;
-  if (a == MachineRepresentation::kWord32 &&
-      b == MachineRepresentation::kFloat64)
-    return MachineRepresentation::kFloat64;
-
-  if (a == MachineRepresentation::kBit) {
-    return b;
   }
-  if (b == MachineRepresentation::kBit) {
-    return a;
+
+  if (a == MachineRepresentation::kTaggedPointer ||
+      b == MachineRepresentation::kTaggedPointer) {
+    return MachineRepresentation::kTaggedPointer;
+  }
+
+  if (a == MachineRepresentation::kFloat64 ||
+      b == MachineRepresentation::kFloat64) {
+    if (a == MachineRepresentation::kBit ||
+        b == MachineRepresentation::kBit) {
+      return MachineRepresentation::kFloat64;
+    }
+    if (a == MachineRepresentation::kWord32 ||
+        b == MachineRepresentation::kWord32) {
+      return MachineRepresentation::kFloat64;
+    }
+    return MachineRepresentation::kFloat64;
+  }
+
+  if (a == MachineRepresentation::kWord32 ||
+      b == MachineRepresentation::kWord32) {
+    if (a == MachineRepresentation::kBit ||
+        b == MachineRepresentation::kBit) {
+      return MachineRepresentation::kWord32;
+    }
+    return MachineRepresentation::kWord32;
+  }
+
+  if (a == MachineRepresentation::kWord64 ||
+      b == MachineRepresentation::kWord64) {
+    return MachineRepresentation::kWord64;
+  }
+
+  if (a == MachineRepresentation::kFloat32 ||
+      b == MachineRepresentation::kFloat32) {
+    if (a == MachineRepresentation::kFloat64 ||
+        b == MachineRepresentation::kFloat64) {
+      return MachineRepresentation::kFloat64;
+    }
+    return MachineRepresentation::kFloat32;
   }
 
   return MachineRepresentation::kTagged;
 }
+
+// ---------------------------------------------------------------------------
+// TSTypeToCompilerType - Free function bridge
+//   Converts an HLE TSType to a TurboFan compiler::Type using a
+//   temporary bridge. This is the main entry point used by external
+//   callers that don't have direct access to a TSToTurboFanBridge.
+// ---------------------------------------------------------------------------
+
+compiler::Type TSTypeToCompilerType(JSHeapBroker* broker,
+                                     TSType* ts_type,
+                                     Zone* zone) {
+  if (ts_type == nullptr) return compiler::Type::Any();
+  if (zone == nullptr) return compiler::Type::Any();
+
+  TSToTurboFanBridge bridge(broker, zone);
+  return bridge.Convert(ts_type);
 
 }  // namespace ts
 }  // namespace internal

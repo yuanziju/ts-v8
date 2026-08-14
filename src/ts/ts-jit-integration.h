@@ -5,6 +5,8 @@
 #ifndef V8_TS_TS_JIT_INTEGRATION_H_
 #define V8_TS_TS_JIT_INTEGRATION_H_
 
+#include <utility>
+
 #include "src/ts/ts-type-system.h"
 #include "src/compiler/turbofan-types.h"
 #include "src/compiler/turbofan-typer.h"
@@ -100,6 +102,10 @@ class TSToTurboFanBridge {
   void WalkAndPreTypeNodes(TFGraph* graph, TypeInfoForJIT* info);
   void ApplyNarrowingToBranch(TFGraph* graph, Node* node,
                               compiler::Type narrowed_type);
+
+  compiler::Type ConstructTypedObjectShape(TSType* ts_type);
+  compiler::Type NumericTypeFromTS(TSType* ts_type);
+  bool IsDeadCodePath(Node* node, TypeInfoForJIT* info);
 };
 
 class TSTurboFanIntegration {
@@ -131,6 +137,14 @@ class TSTurboFanIntegration {
                                            TSTypeSystem* type_system,
                                            TypeInfoForJIT* info,
                                            Zone* zone);
+
+  static void InjectFunctionTypeGuards(PipelineImpl* pipeline,
+                                       TypeInfoForJIT* info,
+                                       Zone* zone);
+
+  static void PreColorGraphNodes(TFGraph* graph,
+                                  TypeInfoForJIT* info,
+                                  TSToTurboFanBridge* bridge);
 };
 
 class TSMaglevIntegration {
@@ -167,6 +181,18 @@ class TSMaglevIntegration {
   static void SkipRedundantChecks(maglev::MaglevCompilationInfo* info,
                                   TypeInfoForJIT* ts_info,
                                   Zone* zone);
+
+  static void ConfigureParameterRepresentations(
+      maglev::MaglevCompilationInfo* info, TypeInfoForJIT* ts_info,
+      Zone* zone);
+
+  static void ConfigureReturnRepresentation(
+      maglev::MaglevCompilationInfo* info, TypeInfoForJIT* ts_info,
+      Zone* zone);
+
+  static void EliminateTypeGuardNodes(
+      maglev::MaglevCompilationInfo* info, TypeInfoForJIT* ts_info,
+      Zone* zone);
 };
 
 compiler::Type TSTypeToCompilerType(JSHeapBroker* broker,
