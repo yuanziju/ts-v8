@@ -86,7 +86,11 @@ void TSParser::ParseTypeAnnotation(TSType** out_type) {
 TSType* TSParser::ParseTypeReference() {
   const AstRawString* name = GetIdentifier();
   const char* type_name = reinterpret_cast<const char*>(name->raw_data());
-  TSType* type = type_system_.NewTypeReference(type_name);
+
+  TSType* type = type_system_.LookupType(type_name);
+  if (type == nullptr) {
+    type = type_system_.NewTypeReference(type_name);
+  }
 
   if (peek() == Token::kLessThan) {
     Next();
@@ -457,7 +461,7 @@ void TSParser::ParseInterfaceDeclaration() {
   Scanner* sc = scanner();
 
   const AstRawString* name = GetIdentifier();
-  USE(name);
+  const char* interface_name = reinterpret_cast<const char*>(name->raw_data());
 
   ZoneList<TypeParameter*>* type_params = nullptr;
   if (peek() == Token::kLessThan) {
@@ -478,22 +482,50 @@ void TSParser::ParseInterfaceDeclaration() {
 
   Expect(Token::kLeftBrace);
 
+  ZoneList<PropertyDescriptor>* properties =
+      zone()->New<ZoneList<PropertyDescriptor>>(0, zone());
+
   while (peek() != Token::kRightBrace && peek() != Token::kEos) {
-    if (CheckContextualKeywordStr(this, sc, avf, "readonly") ||
-        CheckContextualKeywordStr(this, sc, avf, "public") ||
-        CheckContextualKeywordStr(this, sc, avf, "private") ||
-        CheckContextualKeywordStr(this, sc, avf, "protected")) {
+    bool is_readonly = false;
+    bool is_public = true;
+    bool is_private = false;
+    bool is_protected = false;
+
+    if (CheckContextualKeywordStr(this, sc, avf, "readonly")) {
+      is_readonly = true;
+    }
+    if (CheckContextualKeywordStr(this, sc, avf, "public")) {
+      is_public = true;
+      is_private = false;
+      is_protected = false;
+    }
+    if (CheckContextualKeywordStr(this, sc, avf, "private")) {
+      is_private = true;
+      is_public = false;
+    }
+    if (CheckContextualKeywordStr(this, sc, avf, "protected")) {
+      is_protected = true;
+      is_public = false;
     }
 
     if (peek() == Token::kIdentifier || peek() == Token::kPrivateName ||
         peek() == Token::kLeftBracket) {
+      const char* prop_name = nullptr;
       bool is_computed = Check(Token::kLeftBracket);
       if (is_computed) {
         ParseExpression();
         Expect(Token::kRightBracket);
       } else {
-        GetIdentifier();
+        const AstRawString* id = GetIdentifier();
+        prop_name = reinterpret_cast<const char*>(id->raw_data());
       }
+
+      bool is_optional = false;
+      if (Check(Token::kQuestion)) {
+        is_optional = true;
+      }
+
+      TSType* prop_type = nullptr;
 
       if (peek() == Token::kLessThan) {
         Next();
@@ -503,18 +535,35 @@ void TSParser::ParseInterfaceDeclaration() {
         Expect(Token::kGreaterThan);
       }
 
-      Expect(Token::kLeftParen);
-      while (peek() != Token::kRightParen && peek() != Token::kEos) {
-        GetIdentifier();
-        if (Check(Token::kColon)) {
-          ParseUnionType();
+      if (peek() == Token::kLeftParen) {
+        Expect(Token::kLeftParen);
+        while (peek() != Token::kRightParen && peek() != Token::kEos) {
+          GetIdentifier();
+          if (Check(Token::kColon)) {
+            ParseUnionType();
+          }
+          Check(Token::kComma);
         }
-        Check(Token::kComma);
-      }
-      Expect(Token::kRightParen);
+        Expect(Token::kRightParen);
 
-      if (Check(Token::kColon)) {
-        ParseUnionType();
+        if (Check(Token::kColon)) {
+          prop_type = ParseUnionType();
+        }
+      } else if (Check(Token::kColon)) {
+        prop_type = ParseUnionType();
+      }
+
+      if (prop_name != nullptr) {
+        PropertyDescriptor prop;
+        prop.name = prop_name;
+        prop.type = prop_type;
+        prop.is_readonly = is_readonly;
+        prop.is_optional = is_optional;
+        prop.is_public = is_public;
+        prop.is_private = is_private;
+        prop.is_protected = is_protected;
+        prop.has_readonly_modifier = is_readonly;
+        properties->Add(prop, zone());
       }
     } else {
       break;
@@ -524,7 +573,7 @@ void TSParser::ParseInterfaceDeclaration() {
   }
 
   Expect(Token::kRightBrace);
-  USE(type_params);
+  type_system_.RegisterInterface(interface_name, properties, type_params);
 }
 
 void TSParser::ParseEnumDeclaration() {
@@ -532,16 +581,24 @@ void TSParser::ParseEnumDeclaration() {
   Scanner* sc = scanner();
 
   const AstRawString* name = GetIdentifier();
-  USE(name);
+  const char* enum_name = reinterpret_cast<const char*>(name->raw_data());
 
   Expect(Token::kLeftBrace);
+
+  ZoneList<const char*>* members =
+      zone()->New<ZoneList<const char*>>(0, zone());
 
   while (peek() != Token::kRightBrace && peek() != Token::kEos) {
     if (CheckContextualKeywordStr(this, sc, avf, "const")) {
     }
 
-    if (peek() == Token::kIdentifier || peek() == Token::kString ||
-        peek() == Token::kNumber || peek() == Token::kSmi) {
+    if (peek() == Token::kIdentifier) {
+      const AstRawString* member_id = GetIdentifier();
+      const char* member_name =
+          reinterpret_cast<const char*>(member_id->raw_data());
+      members->Add(member_name, zone());
+    } else if (peek() == Token::kString || peek() == Token::kNumber ||
+               peek() == Token::kSmi) {
       Next();
     } else {
       break;
@@ -561,6 +618,7 @@ void TSParser::ParseEnumDeclaration() {
   }
 
   Expect(Token::kRightBrace);
+  type_system_.RegisterEnum(enum_name, members);
 }
 
 void TSParser::ParseNamespaceDeclaration() {
@@ -622,7 +680,7 @@ void TSParser::ParseNamespaceDeclaration() {
 
 void TSParser::ParseTypeAliasDeclaration() {
   const AstRawString* name = GetIdentifier();
-  USE(name);
+  const char* alias_name = reinterpret_cast<const char*>(name->raw_data());
 
   ZoneList<TypeParameter*>* type_params = nullptr;
   if (peek() == Token::kLessThan) {
@@ -634,8 +692,10 @@ void TSParser::ParseTypeAliasDeclaration() {
 
   Expect(Token::kAssign);
   TSType* type = ParseUnionType();
-  USE(type_params);
-  USE(type);
+  if (type != nullptr) {
+    type->set_name(alias_name);
+  }
+  type_system_.RegisterInterface(alias_name, type ? type->properties() : nullptr, type_params);
 }
 
 void TSParser::ParseDecorator() {
@@ -773,18 +833,83 @@ Expression* TSParser::ParseSatisfiesExpression(Expression* expr) {
   return expr;
 }
 
+Statement* TSParser::ParseClassDeclaration(Expression* maybe_name,
+                                          bool is_export) {
+  AstValueFactory* avf = ast_value_factory();
+  Scanner* sc = scanner();
+
+  const AstRawString* name = GetIdentifier();
+  const char* class_name = reinterpret_cast<const char*>(name->raw_data());
+
+  ZoneList<TypeParameter*>* type_params = nullptr;
+  if (peek() == Token::kLessThan) {
+    Next();
+    type_params = zone()->New<ZoneList<TypeParameter*>>(0, zone());
+    ParseTypeParameterDeclaration(type_params);
+    Expect(Token::kGreaterThan);
+  }
+
+  if (IsContextualKeyword(sc, avf, "extends") &&
+      !sc->HasLineTerminatorAfterNext()) {
+    Next();
+    while (true) {
+      ParseTypeReference();
+      if (!Check(Token::kComma)) break;
+    }
+  }
+
+  if (IsContextualKeyword(sc, avf, "implements") &&
+      !sc->HasLineTerminatorAfterNext()) {
+    Next();
+    while (true) {
+      ParseTypeReference();
+      if (!Check(Token::kComma)) break;
+    }
+  }
+
+  Expect(Token::kLeftBrace);
+
+  ZoneList<PropertyDescriptor>* props =
+      zone()->New<ZoneList<PropertyDescriptor>>(0, zone());
+  ParseClassMembersWithTypes(class_name, type_params, props);
+
+  Expect(Token::kRightBrace);
+
+  return nullptr;
+}
+
 void TSParser::ParseClassMembersWithTypes(
+    const char* class_name,
+    ZoneList<TypeParameter*>* type_params,
     ZoneList<PropertyDescriptor>* props) {
   AstValueFactory* avf = ast_value_factory();
   Scanner* sc = scanner();
 
   while (peek() != Token::kRightBrace && peek() != Token::kEos) {
-    if (CheckContextualKeywordStr(this, sc, avf, "readonly") ||
-        CheckContextualKeywordStr(this, sc, avf, "public") ||
-        CheckContextualKeywordStr(this, sc, avf, "private") ||
-        CheckContextualKeywordStr(this, sc, avf, "protected") ||
-        CheckContextualKeywordStr(this, sc, avf, "abstract") ||
-        CheckContextualKeywordStr(this, sc, avf, "override")) {
+    bool is_readonly = false;
+    bool is_public = true;
+    bool is_private = false;
+    bool is_protected = false;
+
+    if (CheckContextualKeywordStr(this, sc, avf, "readonly")) {
+      is_readonly = true;
+    }
+    if (CheckContextualKeywordStr(this, sc, avf, "public")) {
+      is_public = true;
+      is_private = false;
+      is_protected = false;
+    }
+    if (CheckContextualKeywordStr(this, sc, avf, "private")) {
+      is_private = true;
+      is_public = false;
+    }
+    if (CheckContextualKeywordStr(this, sc, avf, "protected")) {
+      is_protected = true;
+      is_public = false;
+    }
+    if (CheckContextualKeywordStr(this, sc, avf, "abstract")) {
+    }
+    if (CheckContextualKeywordStr(this, sc, avf, "override")) {
     }
 
     if (peek() == Token::kStatic) {
@@ -793,10 +918,18 @@ void TSParser::ParseClassMembersWithTypes(
 
     if (peek() == Token::kIdentifier || peek() == Token::kPrivateName ||
         peek() == Token::kGet || peek() == Token::kSet) {
-      GetIdentifier();
+      const AstRawString* id = GetIdentifier();
+      const char* prop_name = reinterpret_cast<const char*>(id->raw_data());
+
+      bool is_optional = false;
+      if (Check(Token::kQuestion)) {
+        is_optional = true;
+      }
+
+      TSType* prop_type = nullptr;
 
       if (Check(Token::kColon)) {
-        ParseUnionType();
+        prop_type = ParseUnionType();
       }
 
       if (peek() == Token::kLeftParen) {
@@ -811,7 +944,7 @@ void TSParser::ParseClassMembersWithTypes(
         Expect(Token::kRightParen);
 
         if (Check(Token::kColon)) {
-          ParseUnionType();
+          prop_type = ParseUnionType();
         }
 
         if (peek() == Token::kLeftBrace) {
@@ -821,13 +954,27 @@ void TSParser::ParseClassMembersWithTypes(
         Next();
         ParseExpression();
       }
+
+      if (prop_name != nullptr) {
+        PropertyDescriptor prop;
+        prop.name = prop_name;
+        prop.type = prop_type;
+        prop.is_readonly = is_readonly;
+        prop.is_optional = is_optional;
+        prop.is_public = is_public;
+        prop.is_private = is_private;
+        prop.is_protected = is_protected;
+        prop.has_readonly_modifier = is_readonly;
+        props->Add(prop, zone());
+      }
     } else {
       Next();
     }
 
     Check(Token::kSemicolon);
   }
-  USE(props);
+
+  type_system_.RegisterClass(class_name, props, type_params);
 }
 
 void TSParser::CheckTypeAnnotation(TSType* annotated_type,

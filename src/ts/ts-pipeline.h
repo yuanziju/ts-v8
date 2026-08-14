@@ -78,6 +78,9 @@ class TSPipeline {
   void CollectTypeAnnotationsRecursive(AstNode* node,
                                        ZoneList<TSType*>* types);
 
+  void CollectCheckerInferredTypes(FunctionLiteral* root);
+  void CollectCheckerTypesRecursive(AstNode* node);
+
   void PropagateTypes(FunctionLiteral* root);
   void PropagateTypesRecursive(AstNode* node);
 

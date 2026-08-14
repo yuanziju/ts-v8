@@ -62,6 +62,9 @@ struct PropertyDescriptor {
   bool is_private;
   bool is_protected;
   bool has_readonly_modifier;
+
+  TSType* GetType() const { return type; }
+  const char* GetName() const { return name; }
 };
 
 struct TypeParameter {
@@ -81,6 +84,7 @@ class TSType : public ZoneObject {
         type_params_(nullptr),
         param_types_(nullptr),
         union_members_(nullptr),
+        union_right_(nullptr),
         type_arguments_(nullptr),
         element_type_(nullptr),
         return_type_(nullptr),
@@ -92,82 +96,103 @@ class TSType : public ZoneObject {
 
   TypeKind kind() const { return kind_; }
 
-  bool IsPrimitive() const {
-    return kind_ == TypeKind::kBoolean || kind_ == TypeKind::kNumber ||
-           kind_ == TypeKind::kString || kind_ == TypeKind::kSymbol ||
-           kind_ == TypeKind::kBigInt || kind_ == TypeKind::kUndefined ||
-           kind_ == TypeKind::kNull || kind_ == TypeKind::kVoid;
+  bool IsPrimitive() const;
+  bool IsObjectLike() const;
+  bool IsFunctionLike() const;
+  bool IsUnion() const;
+  bool IsLiteral() const;
+  bool IsNullable() const;
+  bool IsStringLike() const;
+  bool IsNumberLike() const;
+
+  bool IsObject() const { return kind_ == TypeKind::kObject; }
+  bool IsArray() const { return kind_ == TypeKind::kArray; }
+  bool IsTuple() const { return kind_ == TypeKind::kTuple; }
+  bool IsFunction() const { return kind_ == TypeKind::kFunction; }
+  bool IsInterface() const { return kind_ == TypeKind::kInterface; }
+  bool IsPromise() const { return kind_ == TypeKind::kPromise; }
+  bool IsRecord() const { return kind_ == TypeKind::kRecord; }
+  bool IsPartial() const { return kind_ == TypeKind::kPartial; }
+  bool IsRequired() const { return kind_ == TypeKind::kRequired; }
+  bool IsPick() const { return kind_ == TypeKind::kPick; }
+  bool IsOmit() const { return kind_ == TypeKind::kOmit; }
+  bool IsEnum() const { return kind_ == TypeKind::kEnum; }
+  bool IsConditional() const { return kind_ == TypeKind::kConditional; }
+  bool IsMapped() const { return kind_ == TypeKind::kMapped; }
+  bool IsIndexedAccess() const { return kind_ == TypeKind::kIndexedAccess; }
+  bool IsKeyof() const { return kind_ == TypeKind::kKeyof; }
+  bool IsThis() const { return kind_ == TypeKind::kThis; }
+  bool IsGeneric() const { return kind_ == TypeKind::kGeneric; }
+  bool IsTypeReference() const { return kind_ == TypeKind::kTypeReference; }
+  bool IsParameter() const { return kind_ == TypeKind::kParameter; }
+  bool IsSatisfies() const { return kind_ == TypeKind::kSatisfies; }
+  bool IsNamespace() const { return kind_ == TypeKind::kNamespace; }
+  bool IsIntersection() const { return kind_ == TypeKind::kIntersection; }
+  bool IsReadonly() const { return kind_ == TypeKind::kReadonly; }
+
+  bool IsString() const { return kind_ == TypeKind::kString; }
+  bool IsNumber() const { return kind_ == TypeKind::kNumber; }
+  bool IsBoolean() const { return kind_ == TypeKind::kBoolean; }
+  bool IsVoid() const { return kind_ == TypeKind::kVoid; }
+  bool IsNever() const { return kind_ == TypeKind::kNever; }
+  bool IsAny() const { return kind_ == TypeKind::kAny; }
+  bool IsUnknown() const { return kind_ == TypeKind::kUnknown; }
+  bool IsUndefined() const { return kind_ == TypeKind::kUndefined; }
+  bool IsNull() const { return kind_ == TypeKind::kNull; }
+  bool IsSymbol() const { return kind_ == TypeKind::kSymbol; }
+  bool IsBigInt() const { return kind_ == TypeKind::kBigInt; }
+
+  const char* GetName() const;
+  ZoneList<PropertyDescriptor>* GetProperties() const;
+  TSType* GetElementType() const;
+  ZoneList<TSType*>* GetUnionMembers() const;
+  TSType* GetReturnType() const;
+  ZoneList<TSType*>* GetParamTypes() const;
+  const char* GetLiteralValue() const { return literal_value_; }
+  TSType* GetConstraint() const {
+    return type_params_ && type_params_->length() > 0
+               ? type_params_->at(0)->constraint
+               : nullptr;
   }
-
-  bool IsObjectLike() const {
-    return kind_ == TypeKind::kObject || kind_ == TypeKind::kInterface ||
-           kind_ == TypeKind::kArray || kind_ == TypeKind::kTuple;
+  TSType* GetDefaultType() const {
+    return type_params_ && type_params_->length() > 0
+               ? type_params_->at(0)->default_type
+               : nullptr;
   }
-
-  bool IsFunctionLike() const { return kind_ == TypeKind::kFunction; }
-
-  bool IsUnion() const { return kind_ == TypeKind::kUnion; }
-
-  bool IsLiteral() const { return kind_ == TypeKind::kLiteral; }
-
-  bool IsNullable() const {
-    return kind_ == TypeKind::kNull || kind_ == TypeKind::kUndefined ||
-           kind_ == TypeKind::kAny;
-  }
-
-  bool IsStringLike() const { return kind_ == TypeKind::kString; }
-  bool IsNumberLike() const { return kind_ == TypeKind::kNumber; }
-
-  const char* GetName() const { return name_; }
-
-  ZoneList<PropertyDescriptor>* GetProperties() const { return properties_; }
-
-  TSType* GetElementType() const { return element_type_; }
-
-  ZoneList<TSType*>* GetUnionMembers() const { return union_members_; }
-
-  TSType* GetReturnType() const { return return_type_; }
-
-  ZoneList<TSType*>* GetParamTypes() const { return param_types_; }
+  ZoneList<TSType*>* GetTypeArguments() const { return type_arguments_; }
 
   ZoneList<TSType*>* union_types() const { return union_members_; }
-
   ZoneList<TSType*>* type_arguments() const { return type_arguments_; }
+
+  int arity() const {
+    if (kind_ == TypeKind::kUnion || kind_ == TypeKind::kIntersection) {
+      return union_members_ ? union_members_->length() : 0;
+    }
+    return param_types_ ? param_types_->length() : 0;
+  }
+
+  TSType* AsArrayType() const {
+    return kind_ == TypeKind::kArray ? element_type_ : nullptr;
+  }
 
   void set_referenced_type(TSType* t) { referenced_type_ = t; }
   void set_element_type(TSType* t) { element_type_ = t; }
   void set_return_type(TSType* t) { return_type_ = t; }
 
-  bool IsAssignableTo(const TSType* other) const {
-    if (kind_ == TypeKind::kAny || other->kind_ == TypeKind::kAny) return true;
-    if (kind_ == other->kind_) return true;
-    if (IsLiteral() && other->kind_ == TypeKind::kString) return true;
-    if (IsLiteral() && other->kind_ == TypeKind::kNumber) return true;
-    if (IsLiteral() && other->kind_ == TypeKind::kBoolean) return true;
-    if (kind_ == TypeKind::kNull || kind_ == TypeKind::kUndefined) {
-      return other->IsNullable();
-    }
-    return false;
-  }
+  bool IsAssignableTo(const TSType* other) const;
+  bool IsSubtypeOf(const TSType* other) const;
+  bool IsIdenticalTo(const TSType* other) const;
 
-  bool IsSubtypeOf(const TSType* other) const {
-    return IsAssignableTo(other);
-  }
+  bool HasKnownShape() const;
+  int GetPropertyCount() const;
+  bool IsStable() const;
 
-  bool IsIdenticalTo(const TSType* other) const {
-    return kind_ == other->kind_ && name_ == other->name_;
-  }
-
-  bool HasKnownShape() const { return kind_ == TypeKind::kInterface; }
-  int GetPropertyCount() const { return properties_ ? properties_->length() : 0; }
-  bool IsStable() const { return true; }
-
-  void* ToV8Type(Zone* zone) const { return nullptr; }
+  void* ToV8Type(Zone* zone) const;
 
   ZoneList<PropertyDescriptor>* properties() { return properties_; }
   void set_properties(ZoneList<PropertyDescriptor>* p) { properties_ = p; }
 
-  ZoneList<TypeParameter*>* type_params() { return type_params_; }
+  ZoneList<TypeParameter>* type_params() { return type_params_; }
   void set_type_params(ZoneList<TypeParameter>* tp) { type_params_ = tp; }
 
   void set_name(const char* n) { name_ = n; }
@@ -176,12 +201,44 @@ class TSType : public ZoneObject {
   void set_is_readonly(bool v) { is_readonly_ = v; }
   void set_is_optional(bool v) { is_optional_ = v; }
 
+  static TSType* Any(Zone* zone);
+  static TSType* Unknown(Zone* zone);
+  static TSType* Never(Zone* zone);
+  static TSType* Boolean(Zone* zone);
+  static TSType* Number(Zone* zone);
+  static TSType* String(Zone* zone);
+  static TSType* Symbol(Zone* zone);
+  static TSType* BigInt(Zone* zone);
+  static TSType* Undefined(Zone* zone);
+  static TSType* Null(Zone* zone);
+  static TSType* Void(Zone* zone);
+  static TSType* Object(Zone* zone);
+  static TSType* Function(Zone* zone) {
+    return zone->New<TSType>(TypeKind::kFunction);
+  }
+
+  static TSType* CreateInterface(Zone* zone, const char* name,
+                                 ZoneList<PropertyDescriptor>* properties,
+                                 ZoneList<TypeParameter>* type_params);
+  static TSType* CreateArray(Zone* zone, TSType* element_type);
+  static TSType* CreateTuple(Zone* zone,
+                             ZoneList<TSType*>* element_types);
+  static TSType* CreateFunction(Zone* zone, ZoneList<TSType*>* param_types,
+                                TSType* return_type, bool is_async);
+  static TSType* CreateUnion(Zone* zone, TSType* left, TSType* right);
+  static TSType* CreateIntersection(Zone* zone, TSType* left, TSType* right);
+  static TSType* CreateLiteral(Zone* zone, const char* value,
+                               TSType* base_type);
+  static TSType* CreatePromise(Zone* zone, TSType* value_type);
+  static TSType* CreateGeneric(Zone* zone, TypeParameter* param);
+
  private:
   TypeKind kind_;
   ZoneList<PropertyDescriptor>* properties_;
   ZoneList<TypeParameter>* type_params_;
   ZoneList<TSType*>* param_types_;
   ZoneList<TSType*>* union_members_;
+  TSType* union_right_;
   ZoneList<TSType*>* type_arguments_;
   TSType* element_type_;
   TSType* return_type_;
@@ -194,20 +251,7 @@ class TSType : public ZoneObject {
 
 class TSTypeSystem : public ZoneObject {
  public:
-  explicit TSTypeSystem(Zone* zone)
-      : zone_(zone),
-        initialized_(false),
-        cached_any_(nullptr),
-        cached_never_(nullptr),
-        cached_boolean_(nullptr),
-        cached_number_(nullptr),
-        cached_string_(nullptr),
-        cached_undefined_(nullptr),
-        cached_null_(nullptr),
-        cached_void_(nullptr),
-        cached_unknown_(nullptr),
-        cached_symbol_(nullptr),
-        cached_object_(nullptr) {}
+  explicit TSTypeSystem(Zone* zone);
 
   void Initialize(Zone* zone) {
     if (initialized_) return;
@@ -354,77 +398,35 @@ class TSTypeSystem : public ZoneObject {
 
   void RegisterInterface(const char* name,
                           ZoneList<PropertyDescriptor>* properties,
-                          ZoneList<TypeParameter>* type_params) {
-    registered_names_.Add(name, zone_);
-    TSType* iface = zone_->New<TSType>(zone_, TypeKind::kInterface);
-    iface->set_name(name);
-    iface->set_properties(properties);
-    iface->set_type_params(type_params);
-    registered_types_.Add(iface, zone_);
-  }
+                          ZoneList<TypeParameter>* type_params);
 
   void RegisterClass(const char* name,
                      ZoneList<PropertyDescriptor>* properties,
-                     ZoneList<TypeParameter>* type_params) {
-    registered_names_.Add(name, zone_);
-    TSType* cls = zone_->New<TSType>(zone_, TypeKind::kInterface);
-    cls->set_name(name);
-    cls->set_properties(properties);
-    cls->set_type_params(type_params);
-    registered_types_.Add(cls, zone_);
-  }
+                     ZoneList<TypeParameter>* type_params);
 
-  void RegisterEnum(const char* name, ZoneList<const char*>* members) {
-    registered_names_.Add(name, zone_);
-    TSType* enum_type = zone_->New<TSType>(zone_, TypeKind::kEnum);
-    enum_type->set_name(name);
-    registered_types_.Add(enum_type, zone_);
-  }
+  void RegisterEnum(const char* name, ZoneList<const char*>* members);
 
-  TSType* LookupType(const char* name) const {
-    for (int i = 0; i < registered_names_.length(); i++) {
-      if (strcmp(registered_names_.at(i), name) == 0) {
-        return registered_types_.at(i);
-      }
-    }
-    return nullptr;
-  }
+  TSType* LookupType(const char* name) const;
 
-  TSType* CreateAndCache(Zone* zone, TypeKind kind) {
-    return zone->New<TSType>(zone, kind);
-  }
+  TSType* CreateAndCache(Zone* zone, TypeKind kind);
 
-  TSType* InferBinaryOpType(TSType* left, TSType* right, int op) {
-    if (op == 0 || op == 1 || op == 2) {
-      return NewNumber();
-    }
-    return left;
-  }
+  TSType* InferBinaryOpType(TSType* left, TSType* right, int op);
 
   TSType* InferPropertyAccessType(TSType* object,
-                                   const char* property_name) {
-    return NewAny();
-  }
+                                   const char* property_name);
 
-  TSType* InferCallType(TSType* callee, ZoneList<TSType*>* arg_types) {
-    return NewAny();
-  }
+  TSType* InferCallType(TSType* callee, ZoneList<TSType*>* arg_types);
 
-  TSType* PromoteToCommonType(TSType* a, TSType* b) {
-    if (a->kind() == b->kind()) return a;
-    return NewAny();
-  }
+  TSType* PromoteToCommonType(TSType* a, TSType* b);
 
-  TSType* Widening(TSType* type) { return type; }
+  TSType* Widening(TSType* type);
 
-  TSType* GetAny() { return NewAny(); }
-  TSType* GetNever() { return NewNever(); }
+  TSType* GetAny();
+  TSType* GetNever();
 
-  bool CheckAssignment(TSType* target, TSType* source) {
-    return IsAssignableTo(source, target);
-  }
+  bool CheckAssignment(TSType* target, TSType* source);
 
-  bool CheckCall(TSType* callee, ZoneList<TSType*>* arg_types) { return true; }
+  bool CheckCall(TSType* callee, ZoneList<TSType*>* arg_types);
 
  private:
   Zone* zone_;

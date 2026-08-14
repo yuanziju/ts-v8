@@ -205,6 +205,8 @@ bool TSPipeline::TypeCheckStage(FunctionLiteral* program) {
 
   type_checker_->CheckProgram(program);
 
+  CollectCheckerInferredTypes(program);
+
   return type_checker_->error_count() == 0 || !config_.strict_mode;
 }
 
@@ -478,6 +480,366 @@ void TSPipeline::CollectTypeAnnotationsRecursive(AstNode* node,
       FunctionDeclaration* func_decl = node->AsFunctionDeclaration();
       if (func_decl->fun() != nullptr) {
         CollectTypeAnnotationsRecursive(func_decl->fun(), types);
+      }
+      break;
+    }
+
+    case AstNode::kVariableProxy: {
+      VariableProxy* proxy = node->AsVariableProxy();
+      if (proxy->is_resolved()) {
+        Variable* var = proxy->var();
+        if (var != nullptr) {
+          const char* var_name =
+              reinterpret_cast<const char*>(var->raw_name()->raw_data());
+          TSType* var_type = type_system_->NewAny();
+          for (int i = 0; i < variable_types_->length(); i++) {
+            if (strcmp(variable_types_->at(i).first, var_name) == 0) {
+              var_type = variable_types_->at(i).second;
+              break;
+            }
+          }
+        }
+      }
+      break;
+    }
+
+    case AstNode::kLiteral:
+    case AstNode::kSmi:
+    case AstNode::kHeapNumber:
+    case AstNode::kString:
+    case AstNode::kConsString:
+    case AstNode::kBoolean:
+    case AstNode::kUndefined:
+    case AstNode::kNull:
+    case AstNode::kThisExpression:
+    case AstNode::kDoWhileStatement:
+    case AstNode::kEmptyStatement:
+    case AstNode::kDebuggerStatement:
+    case AstNode::kBreakStatement:
+    case AstNode::kContinueStatement:
+    case AstNode::kSwitchStatement:
+    case AstNode::kForInStatement:
+    case AstNode::kForOfStatement:
+    case AstNode::kClassDeclaration:
+    case AstNode::kSuperCall:
+    case AstNode::kSuperProperty:
+    case AstNode::kTemplateLiteral:
+    case AstNode::kTaggedTemplate:
+    case AstNode::kYield:
+    case AstNode::kYieldStar:
+    case AstNode::kAwait:
+    case AstNode::kSpread:
+    case AstNode::kOptionalChain:
+    case AstNode::kConditionalChain:
+    case AstNode::kCallNew:
+    case AstNode::kDelete:
+    case AstNode::kTypeOf:
+    case AstNode::kVoid:
+    case AstNode::kUnaryOperation:
+    case AstNode::kCompareOperation:
+    case AstNode::kRegExpLiteral:
+    case AstNode::kNew:
+    case AstNode::kClassLiteral:
+    case AstNode::kWhileFor:
+      break;
+  }
+}
+
+void TSPipeline::CollectCheckerInferredTypes(FunctionLiteral* root) {
+  if (root == nullptr || zone_ == nullptr) return;
+  if (type_checker_ == nullptr) return;
+
+  variable_types_ = zone_->New<ZoneList<std::pair<const char*, TSType*>>>(
+      0, zone_);
+  parameter_types_ =
+      zone_->New<ZoneList<std::pair<int, TSType*>>>(0, zone_);
+  function_return_type_ = nullptr;
+
+  CollectCheckerTypesRecursive(root);
+}
+
+void TSPipeline::CollectCheckerTypesRecursive(AstNode* node) {
+  if (node == nullptr) return;
+
+  switch (node->node_type()) {
+    case AstNode::kFunctionLiteral: {
+      FunctionLiteral* func = node->AsFunctionLiteral();
+      if (func->scope() != nullptr) {
+        DeclarationScope* scope = func->scope();
+        int param_count = func->parameter_count();
+        for (int i = 0; i < param_count; i++) {
+          Variable* var = scope->parameter(i);
+          if (var != nullptr) {
+            TSType* param_type = type_system_->NewAny();
+            const char* param_name =
+                reinterpret_cast<const char*>(var->raw_name()->raw_data());
+            bool found = false;
+            for (int j = 0; j < parameter_types_->length(); j++) {
+              if (parameter_types_->at(j).first == i) {
+                param_type = parameter_types_->at(j).second;
+                found = true;
+                break;
+              }
+            }
+            if (!found) {
+              TSType* checker_type =
+                  type_checker_->CheckExpression(func->body());
+              if (checker_type != nullptr &&
+                  checker_type->kind() != TypeKind::kAny) {
+                param_type = checker_type;
+              }
+              parameter_types_->Add(std::make_pair(i, param_type), zone_);
+            }
+            variable_types_->Add(std::make_pair(param_name, param_type),
+                                 zone_);
+          }
+        }
+      }
+      if (func->body() != nullptr) {
+        ZonePtrList<Statement>* body = func->body();
+        for (int i = 0; i < static_cast<int>(body->size()); i++) {
+          CollectCheckerTypesRecursive((*body)[i]);
+        }
+      }
+      break;
+    }
+
+    case AstNode::kVariableDeclaration: {
+      VariableDeclaration* var_decl = node->AsVariableDeclaration();
+      Variable* var = var_decl->var();
+      if (var != nullptr) {
+        const char* var_name =
+            reinterpret_cast<const char*>(var->raw_name()->raw_data());
+        TSType* inferred = type_system_->NewAny();
+        if (var_decl->init() != nullptr) {
+          inferred = type_checker_->CheckExpression(var_decl->init());
+          if (inferred == nullptr) {
+            inferred = type_system_->NewAny();
+          }
+        }
+        bool found = false;
+        for (int i = 0; i < variable_types_->length(); i++) {
+          if (strcmp(variable_types_->at(i).first, var_name) == 0) {
+            variable_types_->at(i).second = inferred;
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          variable_types_->Add(std::make_pair(var_name, inferred), zone_);
+        }
+      }
+      if (var_decl->init() != nullptr) {
+        CollectCheckerTypesRecursive(var_decl->init());
+      }
+      break;
+    }
+
+    case AstNode::kAssignment: {
+      Assignment* assign = node->AsAssignment();
+      if (assign->target() != nullptr) {
+        CollectCheckerTypesRecursive(assign->target());
+      }
+      if (assign->value() != nullptr) {
+        TSType* value_type = type_checker_->CheckExpression(assign->value());
+        if (value_type != nullptr && assign->target() != nullptr &&
+            assign->target()->is_variable()) {
+          VariableProxy* proxy = assign->target()->AsVariableProxy();
+          if (proxy->is_resolved()) {
+            Variable* var = proxy->var();
+            const char* var_name =
+                reinterpret_cast<const char*>(var->raw_name()->raw_data());
+            for (int i = 0; i < variable_types_->length(); i++) {
+              if (strcmp(variable_types_->at(i).first, var_name) == 0) {
+                variable_types_->at(i).second = value_type;
+                break;
+              }
+            }
+          }
+        }
+        CollectCheckerTypesRecursive(assign->value());
+      }
+      break;
+    }
+
+    case AstNode::kReturnStatement: {
+      ReturnStatement* ret = node->AsReturnStatement();
+      if (ret->expression() != nullptr) {
+        TSType* ret_type = type_checker_->CheckExpression(ret->expression());
+        if (ret_type != nullptr) {
+          if (function_return_type_ == nullptr ||
+              (ret_type->kind() != TypeKind::kAny &&
+               function_return_type_->kind() == TypeKind::kAny)) {
+            function_return_type_ = ret_type;
+          }
+        }
+        CollectCheckerTypesRecursive(ret->expression());
+      }
+      break;
+    }
+
+    case AstNode::kCall: {
+      Call* call = node->AsCall();
+      if (call->expression() != nullptr) {
+        CollectCheckerTypesRecursive(call->expression());
+      }
+      ZonePtrList<Expression>* args = call->arguments();
+      if (args != nullptr) {
+        for (int i = 0; i < static_cast<int>(args->size()); i++) {
+          CollectCheckerTypesRecursive((*args)[i]);
+        }
+      }
+      break;
+    }
+
+    case AstNode::kIfStatement: {
+      IfStatement* if_stmt = node->AsIfStatement();
+      if (if_stmt->condition() != nullptr) {
+        CollectCheckerTypesRecursive(if_stmt->condition());
+      }
+      if (if_stmt->then_statement() != nullptr) {
+        CollectCheckerTypesRecursive(if_stmt->then_statement());
+      }
+      if (if_stmt->else_statement() != nullptr) {
+        CollectCheckerTypesRecursive(if_stmt->else_statement());
+      }
+      break;
+    }
+
+    case AstNode::kForStatement: {
+      ForStatement* for_stmt = node->AsForStatement();
+      if (for_stmt->init() != nullptr) {
+        CollectCheckerTypesRecursive(for_stmt->init());
+      }
+      if (for_stmt->condition() != nullptr) {
+        CollectCheckerTypesRecursive(for_stmt->condition());
+      }
+      if (for_stmt->next() != nullptr) {
+        CollectCheckerTypesRecursive(for_stmt->next());
+      }
+      if (for_stmt->body() != nullptr) {
+        CollectCheckerTypesRecursive(for_stmt->body());
+      }
+      break;
+    }
+
+    case AstNode::kWhileStatement: {
+      WhileStatement* while_stmt = node->AsWhileStatement();
+      if (while_stmt->condition() != nullptr) {
+        CollectCheckerTypesRecursive(while_stmt->condition());
+      }
+      if (while_stmt->body() != nullptr) {
+        CollectCheckerTypesRecursive(while_stmt->body());
+      }
+      break;
+    }
+
+    case AstNode::kBlock: {
+      Block* block = node->AsBlock();
+      if (block->statements() != nullptr) {
+        ZonePtrList<Statement>* stmts = block->statements();
+        for (int i = 0; i < static_cast<int>(stmts->size()); i++) {
+          CollectCheckerTypesRecursive((*stmts)[i]);
+        }
+      }
+      break;
+    }
+
+    case AstNode::kExpressionStatement: {
+      ExpressionStatement* expr_stmt = node->AsExpressionStatement();
+      if (expr_stmt->expression() != nullptr) {
+        CollectCheckerTypesRecursive(expr_stmt->expression());
+      }
+      break;
+    }
+
+    case AstNode::kBinaryOperation: {
+      BinaryOperation* binop = node->AsBinaryOperation();
+      if (binop->left() != nullptr) {
+        CollectCheckerTypesRecursive(binop->left());
+      }
+      if (binop->right() != nullptr) {
+        CollectCheckerTypesRecursive(binop->right());
+      }
+      break;
+    }
+
+    case AstNode::kProperty: {
+      Property* prop = node->AsProperty();
+      if (prop->obj() != nullptr) {
+        CollectCheckerTypesRecursive(prop->obj());
+      }
+      if (prop->key() != nullptr) {
+        CollectCheckerTypesRecursive(prop->key());
+      }
+      break;
+    }
+
+    case AstNode::kObjectLiteral: {
+      ObjectLiteral* obj = node->AsObjectLiteral();
+      if (obj->properties() != nullptr) {
+        ZonePtrList<ObjectLiteralProperty>* props = obj->properties();
+        for (int i = 0; i < static_cast<int>(props->size()); i++) {
+          ObjectLiteralProperty* prop = (*props)[i];
+          if (prop->value() != nullptr) {
+            CollectCheckerTypesRecursive(prop->value());
+          }
+        }
+      }
+      break;
+    }
+
+    case AstNode::kArrayLiteral: {
+      ArrayLiteral* arr = node->AsArrayLiteral();
+      if (arr->elements() != nullptr) {
+        ZonePtrList<Expression>* elems = arr->elements();
+        for (int i = 0; i < static_cast<int>(elems->size()); i++) {
+          CollectCheckerTypesRecursive((*elems)[i]);
+        }
+      }
+      break;
+    }
+
+    case AstNode::kConditional: {
+      Conditional* cond = node->AsConditional();
+      if (cond->condition() != nullptr) {
+        CollectCheckerTypesRecursive(cond->condition());
+      }
+      if (cond->then_expression() != nullptr) {
+        CollectCheckerTypesRecursive(cond->then_expression());
+      }
+      if (cond->else_expression() != nullptr) {
+        CollectCheckerTypesRecursive(cond->else_expression());
+      }
+      break;
+    }
+
+    case AstNode::kFunctionDeclaration: {
+      FunctionDeclaration* func_decl = node->AsFunctionDeclaration();
+      if (func_decl->fun() != nullptr) {
+        CollectCheckerTypesRecursive(func_decl->fun());
+      }
+      break;
+    }
+
+    case AstNode::kThrow: {
+      Throw* throw_expr = node->AsThrow();
+      if (throw_expr->expression() != nullptr) {
+        CollectCheckerTypesRecursive(throw_expr->expression());
+      }
+      break;
+    }
+
+    case AstNode::kTryCatchStatement: {
+      TryCatchStatement* try_stmt = node->AsTryCatchStatement();
+      if (try_stmt->try_block() != nullptr) {
+        CollectCheckerTypesRecursive(try_stmt->try_block());
+      }
+      if (try_stmt->catch_block() != nullptr) {
+        CollectCheckerTypesRecursive(try_stmt->catch_block());
+      }
+      if (try_stmt->finally_block() != nullptr) {
+        CollectCheckerTypesRecursive(try_stmt->finally_block());
       }
       break;
     }

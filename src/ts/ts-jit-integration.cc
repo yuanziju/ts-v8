@@ -193,6 +193,26 @@ compiler::Type TSToTurboFanBridge::ConvertArray(TSType* ts_type) {
 }
 
 compiler::Type TSToTurboFanBridge::ConvertFunction(TSType* ts_type) {
+  TSType* return_type = ts_type->GetReturnType();
+  ZoneList<TSType*>* param_types = ts_type->GetParamTypes();
+
+  if (return_type == nullptr &&
+      (param_types == nullptr || param_types->length() == 0)) {
+    return compiler::Type::Function();
+  }
+
+  if (return_type != nullptr) {
+    compiler::Type converted_return = Convert(return_type);
+    ZoneVector<compiler::Type> param_conversions;
+    if (param_types != nullptr) {
+      param_conversions.reserve(param_types->length());
+      for (int i = 0; i < param_types->length(); i++) {
+        param_conversions.push_back(Convert(param_types->at(i)));
+      }
+    }
+    return compiler::Type::Function();
+  }
+
   return compiler::Type::Function();
 }
 
@@ -265,9 +285,22 @@ compiler::Type TSToTurboFanBridge::ConvertLiteral(TSType* ts_type) {
 
 compiler::Type TSToTurboFanBridge::ConvertFunctionSignature(
     TSType* return_type, ZoneList<TSType*>* param_types) {
-  if (return_type == nullptr && param_types == nullptr) {
+  if (return_type == nullptr &&
+      (param_types == nullptr || param_types->length() == 0)) {
     return compiler::Type::Function();
   }
+
+  if (return_type != nullptr) {
+    compiler::Type converted_return = Convert(return_type);
+    return compiler::Type::Function();
+  }
+
+  if (param_types != nullptr && param_types->length() > 0) {
+    for (int i = 0; i < param_types->length(); i++) {
+      Convert(param_types->at(i));
+    }
+  }
+
   return compiler::Type::Function();
 }
 
@@ -427,6 +460,22 @@ void TSTurboFanIntegration::BeforeTyperPhase(PipelineImpl* pipeline,
   TFGraph* graph = data->graph();
   if (graph == nullptr) return;
 
+  Node* start = graph->start();
+  if (start != nullptr) {
+    int param_count = start->InputCount();
+    ZoneList<TSType*>* param_types =
+        zone->New<ZoneList<TSType*>>(param_count, zone);
+    for (int i = 0; i < param_count; i++) {
+      TSType* param_type = type_system->NewAny();
+      param_types->Add(param_type, zone);
+    }
+    info.param_types = param_types;
+    info.has_explicit_param_types = false;
+
+    info.return_type = type_system->NewAny();
+    info.has_explicit_return_type = false;
+  }
+
   bridge.PreTypeGraph(graph, &info);
 }
 
@@ -445,19 +494,28 @@ void TSTurboFanIntegration::AfterTyperPhase(PipelineImpl* pipeline,
 
   TypeInfoForJIT info;
   info.is_strict = true;
+  info.should_skip_type_checks = true;
 
   TFGraph* graph = data->graph();
   if (graph == nullptr) return;
 
   Node* end = graph->end();
-  if (end != nullptr && info.return_type != nullptr) {
-    compiler::Type return_type = bridge.Convert(info.return_type);
-    if (!return_type.IsInvalid()) {
-      compiler::Type existing = compiler::NodeProperties::GetType(end);
-      if (!existing.IsInvalid()) {
-        compiler::Type refined =
-            compiler::Type::Intersect(existing, return_type, zone);
-        compiler::NodeProperties::SetType(end, refined);
+  if (end != nullptr) {
+    TSType* return_type = type_system->NewAny();
+    info.return_type = return_type;
+    info.has_explicit_return_type = false;
+
+    if (info.return_type != nullptr) {
+      compiler::Type converted_return = bridge.Convert(info.return_type);
+      if (!converted_return.IsInvalid()) {
+        compiler::Type existing = compiler::NodeProperties::GetType(end);
+        if (!existing.IsInvalid()) {
+          compiler::Type refined =
+              compiler::Type::Intersect(existing, converted_return, zone);
+          compiler::NodeProperties::SetType(end, refined);
+        } else {
+          compiler::NodeProperties::SetType(end, converted_return);
+        }
       }
     }
   }

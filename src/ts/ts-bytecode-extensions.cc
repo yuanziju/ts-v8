@@ -125,16 +125,34 @@ void TSBytecodeBuilder::LoadTypedVariable(const AstRawString* name,
       break;
 
     case TSBytecodeStrategy::kSkipTypeChecks:
-    case TSBytecodeStrategy::kSpecializedPath:
       builder_->LoadGlobal(name, feedback_slot, TypeofMode::kNotInside);
       if (config_.skip_tonumber_conversion &&
           expected_type->IsNumberLike()) {
-        // Number typed variable: skip ToNumber by loading directly
-        // The value is already guaranteed to be a number
+        builder_->WriteBytecode<Bytecode::kCheckNumber>();
       }
       if (config_.skip_toboolean_conversion &&
           expected_type->kind() == TypeKind::kBoolean) {
-        // Boolean typed variable: skip ToBoolean by using kAlreadyBoolean
+        builder_->WriteBytecode<Bytecode::kCheckBoolean>();
+      }
+      break;
+
+    case TSBytecodeStrategy::kSpecializedPath:
+      builder_->LoadGlobal(name, feedback_slot, TypeofMode::kNotInside);
+      if (config_.use_smi_fast_paths &&
+          expected_type->IsNumberLike()) {
+        builder_->WriteBytecode<Bytecode::kCheckSmi>();
+      }
+      if (config_.skip_tonumber_conversion &&
+          expected_type->IsNumberLike()) {
+        builder_->WriteBytecode<Bytecode::kCheckNumber>();
+      }
+      if (config_.skip_toboolean_conversion &&
+          expected_type->kind() == TypeKind::kBoolean) {
+        builder_->WriteBytecode<Bytecode::kCheckBoolean>();
+      }
+      if (config_.skip_string_conversion &&
+          expected_type->kind() == TypeKind::kString) {
+        builder_->WriteBytecode<Bytecode::kCheckString>();
       }
       break;
 
@@ -166,17 +184,31 @@ void TSBytecodeBuilder::LoadTypedProperty(Register object,
       break;
 
     case TSBytecodeStrategy::kSkipTypeChecks:
+      builder_->LoadNamedProperty(object, name, feedback_slot);
+      if (config_.skip_tonumber_conversion && expected_type->IsNumberLike()) {
+        builder_->WriteBytecode<Bytecode::kCheckNumber>();
+      }
+      break;
+
     case TSBytecodeStrategy::kSpecializedPath:
       if (config_.inline_property_access && expected_type->IsObjectLike()) {
-        // Inline property access for typed objects:
-        // The Map is known from the TS type, so we can generate
-        // a direct field load instead of a full IC check
         builder_->LoadNamedProperty(object, name, feedback_slot);
       } else if (config_.use_smi_fast_paths &&
                  expected_type->IsNumberLike()) {
-        // Smi fast path: the property is typed as number,
-        // so the IC will specialize to Smi operations
         builder_->LoadNamedProperty(object, name, feedback_slot);
+        builder_->WriteBytecode<Bytecode::kCheckSmi>();
+      } else if (config_.skip_tonumber_conversion &&
+                 expected_type->IsNumberLike()) {
+        builder_->LoadNamedProperty(object, name, feedback_slot);
+        builder_->WriteBytecode<Bytecode::kCheckNumber>();
+      } else if (config_.skip_toboolean_conversion &&
+                 expected_type->kind() == TypeKind::kBoolean) {
+        builder_->LoadNamedProperty(object, name, feedback_slot);
+        builder_->WriteBytecode<Bytecode::kCheckBoolean>();
+      } else if (config_.skip_string_conversion &&
+                 expected_type->kind() == TypeKind::kString) {
+        builder_->LoadNamedProperty(object, name, feedback_slot);
+        builder_->WriteBytecode<Bytecode::kCheckString>();
       } else {
         builder_->LoadNamedProperty(object, name, feedback_slot);
       }
@@ -205,14 +237,27 @@ void TSBytecodeBuilder::StoreTypedVariable(const AstRawString* name,
 
   switch (strategy) {
     case TSBytecodeStrategy::kSkipTypeChecks:
-    case TSBytecodeStrategy::kSpecializedPath:
-      // The value in the accumulator is already typed as declared.
-      // Skip the type check and store directly.
       builder_->StoreGlobal(name, feedback_slot);
       break;
 
+    case TSBytecodeStrategy::kSpecializedPath:
+      if (config_.use_smi_fast_paths && value_type->IsNumberLike()) {
+        builder_->WriteBytecode<Bytecode::kCheckSmi>();
+        builder_->StoreGlobal(name, feedback_slot);
+      } else if (config_.skip_toboolean_conversion &&
+                 value_type->kind() == TypeKind::kBoolean) {
+        builder_->WriteBytecode<Bytecode::kCheckBoolean>();
+        builder_->StoreGlobal(name, feedback_slot);
+      } else if (config_.skip_string_conversion &&
+                 value_type->kind() == TypeKind::kString) {
+        builder_->WriteBytecode<Bytecode::kCheckString>();
+        builder_->StoreGlobal(name, feedback_slot);
+      } else {
+        builder_->StoreGlobal(name, feedback_slot);
+      }
+      break;
+
     case TSBytecodeStrategy::kFullCheck:
-      // Generate a runtime type check before storing
       builder_->StoreGlobal(name, feedback_slot);
       break;
 
@@ -238,14 +283,27 @@ void TSBytecodeBuilder::StoreTypedProperty(Register object,
 
   switch (strategy) {
     case TSBytecodeStrategy::kSkipTypeChecks:
+      builder_->SetNamedProperty(object, name, feedback_slot,
+                                  LanguageMode::kSloppy);
+      break;
+
     case TSBytecodeStrategy::kSpecializedPath:
       if (config_.inline_property_access && value_type->IsObjectLike()) {
-        // Object-like value: use direct property set without map check
         builder_->SetNamedProperty(object, name, feedback_slot,
                                     LanguageMode::kSloppy);
       } else if (config_.use_smi_fast_paths &&
                  value_type->IsNumberLike()) {
-        // Number value: the IC will specialize to Smi store
+        builder_->WriteBytecode<Bytecode::kCheckSmi>();
+        builder_->SetNamedProperty(object, name, feedback_slot,
+                                    LanguageMode::kSloppy);
+      } else if (config_.skip_toboolean_conversion &&
+                 value_type->kind() == TypeKind::kBoolean) {
+        builder_->WriteBytecode<Bytecode::kCheckBoolean>();
+        builder_->SetNamedProperty(object, name, feedback_slot,
+                                    LanguageMode::kSloppy);
+      } else if (config_.skip_string_conversion &&
+                 value_type->kind() == TypeKind::kString) {
+        builder_->WriteBytecode<Bytecode::kCheckString>();
         builder_->SetNamedProperty(object, name, feedback_slot,
                                     LanguageMode::kSloppy);
       } else {
@@ -255,7 +313,6 @@ void TSBytecodeBuilder::StoreTypedProperty(Register object,
       break;
 
     case TSBytecodeStrategy::kFullCheck:
-      // Full type check before storing the value
       builder_->SetNamedProperty(object, name, feedback_slot,
                                   LanguageMode::kSloppy);
       break;
@@ -287,10 +344,11 @@ void TSBytecodeBuilder::BinaryOperationTyped(Token::Value op,
   switch (strategy) {
     case TSBytecodeStrategy::kSpecializedPath:
       if (config_.use_smi_fast_paths && operand_type->IsNumberLike()) {
-        // Smi fast path for number arithmetic:
-        // Use specialized bytecode that operates on Smis directly
-        // without requiring HeapNumber conversion checks
-        builder_->BinaryOperation(op, reg, feedback_slot);
+        builder_->WriteBytecode<Bytecode::kBinaryOperationSmi>(op, reg,
+                                                         feedback_slot);
+      } else if (operand_type->kind() == TypeKind::kString) {
+        builder_->WriteBytecode<Bytecode::kBinaryOperation>(op, reg,
+                                                         feedback_slot);
       } else {
         builder_->BinaryOperation(op, reg, feedback_slot);
       }
@@ -301,7 +359,6 @@ void TSBytecodeBuilder::BinaryOperationTyped(Token::Value op,
       break;
 
     case TSBytecodeStrategy::kFullCheck:
-      // Full check: generate binary operation with type feedback
       builder_->BinaryOperation(op, reg, feedback_slot);
       break;
 
@@ -327,12 +384,11 @@ void TSBytecodeBuilder::CompareOperationTyped(Token::Value op,
   switch (strategy) {
     case TSBytecodeStrategy::kSpecializedPath:
       if (config_.use_smi_fast_paths && operand_type->IsNumberLike()) {
-        // Smi fast path for comparisons:
-        // Use direct Smi comparison without heap checks
-        builder_->CompareOperation(op, reg, feedback_slot);
+        builder_->WriteBytecode<Bytecode::kCompareOperationSmi>(op, reg,
+                                                         feedback_slot);
       } else if (operand_type->kind() == TypeKind::kString) {
-        // String comparison: use optimized string compare
-        builder_->CompareOperation(op, reg, feedback_slot);
+        builder_->WriteBytecode<Bytecode::kCompareOperation>(op, reg,
+                                                         feedback_slot);
       } else {
         builder_->CompareOperation(op, reg, feedback_slot);
       }
@@ -369,21 +425,21 @@ void TSBytecodeBuilder::ReturnTyped(ToBooleanMode mode,
 
   switch (strategy) {
     case TSBytecodeStrategy::kSkipTypeChecks:
+      builder_->Return();
+      break;
+
     case TSBytecodeStrategy::kSpecializedPath:
       if (config_.skip_toboolean_conversion &&
           return_type->kind() == TypeKind::kBoolean) {
-        // The return value is typed as boolean.
-        // Skip ToBoolean conversion and return directly.
+        builder_->WriteBytecode<Bytecode::kCheckBoolean>();
         builder_->Return();
       } else if (config_.skip_tonumber_conversion &&
                  return_type->IsNumberLike()) {
-        // The return value is typed as number.
-        // Skip ToNumber conversion and return directly.
+        builder_->WriteBytecode<Bytecode::kCheckNumber>();
         builder_->Return();
       } else if (config_.skip_string_conversion &&
                  return_type->kind() == TypeKind::kString) {
-        // The return value is typed as string.
-        // Skip ToString conversion and return directly.
+        builder_->WriteBytecode<Bytecode::kCheckString>();
         builder_->Return();
       } else {
         builder_->Return();
@@ -391,8 +447,6 @@ void TSBytecodeBuilder::ReturnTyped(ToBooleanMode mode,
       break;
 
     case TSBytecodeStrategy::kFullCheck:
-      // Full type check: verify the returned value matches
-      // the declared return type before returning
       builder_->Return();
       break;
 
@@ -490,15 +544,12 @@ void TSBytecodeBuilder::CreateTypedObject(TSType* object_type,
 
   switch (strategy) {
     case TSBytecodeStrategy::kSkipTypeChecks:
+      builder_->CreateEmptyObjectLiteral();
+      break;
+
     case TSBytecodeStrategy::kSpecializedPath:
       if (object_type->HasKnownShape()) {
-        // The TS type has a known shape (interface with properties).
-        // Create an object literal with pre-allocated Map based on the
-        // TS type's property structure. The number of properties is known
-        // at compile time, so we can allocate the backing store with
-        // the exact size needed.
-        int property_count = object_type->GetPropertyCount();
-        builder_->CreateEmptyObjectLiteral();
+        builder_->WriteBytecode<Bytecode::kCreateEmptyObjectLiteral>();
       } else {
         builder_->CreateEmptyObjectLiteral();
       }
@@ -527,12 +578,16 @@ void TSBytecodeBuilder::CreateTypedArray(TSType* element_type,
 
   switch (strategy) {
     case TSBytecodeStrategy::kSkipTypeChecks:
-    case TSBytecodeStrategy::kSpecializedPath:
-      // Typed array creation: the element type is known,
-      // so we can create the array with the appropriate
-      // allocation strategy (e.g., packed for numbers,
-      // or dictionary for objects).
       builder_->CreateEmptyArrayLiteral(feedback_slot);
+      break;
+
+    case TSBytecodeStrategy::kSpecializedPath:
+      if (element_type->IsNumberLike()) {
+        builder_->WriteBytecode<Bytecode::kCreateEmptyArrayLiteral>(
+                                 feedback_slot);
+      } else {
+        builder_->CreateEmptyArrayLiteral(feedback_slot);
+      }
       break;
 
     case TSBytecodeStrategy::kFullCheck:
@@ -550,8 +605,7 @@ void TSBytecodeBuilder::CreateTypedFunction(TSType* function_type,
                                              int feedback_slot) {
   if (function_type == nullptr || function_type->kind() == TypeKind::kAny ||
       function_type->kind() == TypeKind::kUnknown) {
-    // Without type information, create a standard function
-    // The SharedFunctionInfo would need to be set up externally
+    builder_->WriteBytecode<Bytecode::kCreateClosure>(feedback_slot);
     return;
   }
 
@@ -559,20 +613,30 @@ void TSBytecodeBuilder::CreateTypedFunction(TSType* function_type,
 
   switch (strategy) {
     case TSBytecodeStrategy::kSkipTypeChecks:
+      builder_->WriteBytecode<Bytecode::kCreateClosure>(feedback_slot);
+      break;
+
     case TSBytecodeStrategy::kSpecializedPath:
-      // The function type specifies parameter and return types.
-      // This information can be used for:
-      // 1. Specializing the function's bytecode (already handled
-      //    by the TSBytecodeIntegrator during bytecode generation)
-      // 2. Creating a closure with pre-optimized SharedFunctionInfo
-      // 3. Inlining opportunities at call sites
+      builder_->WriteBytecode<Bytecode::kCreateClosure>(feedback_slot);
+      if (function_type->GetReturnType() != nullptr) {
+        TSType* ret_type = function_type->GetReturnType();
+        if (ret_type->IsNumberLike()) {
+          builder_->WriteBytecode<Bytecode::kCheckNumber>();
+        } else if (ret_type->kind() == TypeKind::kBoolean) {
+          builder_->WriteBytecode<Bytecode::kCheckBoolean>();
+        } else if (ret_type->kind() == TypeKind::kString) {
+          builder_->WriteBytecode<Bytecode::kCheckString>();
+        }
+      }
       break;
 
     case TSBytecodeStrategy::kFullCheck:
+      builder_->WriteBytecode<Bytecode::kCreateClosure>(feedback_slot);
       break;
 
     case TSBytecodeStrategy::kDefault:
     case TSBytecodeStrategy::kSkipHoleChecks:
+      builder_->WriteBytecode<Bytecode::kCreateClosure>(feedback_slot);
       break;
   }
 }
